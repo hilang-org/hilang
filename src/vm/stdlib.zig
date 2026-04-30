@@ -1880,6 +1880,15 @@ pub fn loadSUnit(heap: *Heap, g: *Globals) !void {
         try ret(c, try varRef(c, "x")),
     });
 
+    // at: i put: x  array at: firstIndex + i - 1 put: x. ^x
+    try defineMethod(c, oc, "at:put:", &.{ "i", "x" }, &.{}, &.{
+        try send(c, try varRef(c, "array"), "at:put:", &.{
+            try send(c, try send(c, try varRef(c, "firstIndex"), "+", &.{try varRef(c, "i")}), "-", &.{try litInt(c, 1)}),
+            try varRef(c, "x"),
+        }),
+        try ret(c, try varRef(c, "x")),
+    });
+
     // do: aBlock
     //   | i |
     //   i := firstIndex.
@@ -1926,6 +1935,264 @@ pub fn loadSUnit(heap: *Heap, g: *Globals) !void {
 
     // collect:, select:, reject:, inject:into:, includes:, count:
     // all inherited from Collection.
+
+    // ---- SortedCollection ----
+    //
+    // Maintains ascending order on add: via a single bubble pass
+    // from the just-appended tail. O(n) per insert; fine for the
+    // small collections LLM programs typically build. Inherits
+    // size, at:, at:put:, do:, removeFirst, etc. from OC.
+    const sorted_oc = try defineClassAndRegister(heap, g, "SortedCollection", oc, &.{});
+
+    // SortedCollection>>add: x  super addLast: x. self bubbleLast. ^x
+    try defineMethod(c, sorted_oc, "add:", &.{"x"}, &.{}, &.{
+        try superSend(c, "addLast:", &.{try varRef(c, "x")}),
+        try send(c, try varRef(c, "self"), "bubbleLast", &.{}),
+        try ret(c, try varRef(c, "x")),
+    });
+    // SortedCollection>>addLast: x  ^self add: x   (preserve invariant)
+    try defineMethod(c, sorted_oc, "addLast:", &.{"x"}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "add:", &.{try varRef(c, "x")})),
+    });
+    // SortedCollection>>addFirst: x  ^self add: x  (sorted order ignores prepend intent)
+    try defineMethod(c, sorted_oc, "addFirst:", &.{"x"}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "add:", &.{try varRef(c, "x")})),
+    });
+
+    // SortedCollection>>bubbleLast
+    //   | i t |
+    //   i := self size.
+    //   [i > 1 and: [(self at: i - 1) > (self at: i)]] whileTrue: [
+    //     t := self at: i. self at: i put: (self at: i - 1). self at: i - 1 put: t.
+    //     i := i - 1]
+    try defineMethod(c, sorted_oc, "bubbleLast", &.{}, &.{ "i", "t" }, &.{
+        try assignNode(c, "i", try send(c, try varRef(c, "self"), "size", &.{})),
+        try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try send(c, try varRef(c, "i"), ">", &.{try litInt(c, 1)}), "and:", &.{
+                try block(c, &.{}, &.{}, &.{
+                    try send(c, try send(c, try varRef(c, "self"), "at:", &.{
+                        try send(c, try varRef(c, "i"), "-", &.{try litInt(c, 1)}),
+                    }), ">", &.{
+                        try send(c, try varRef(c, "self"), "at:", &.{try varRef(c, "i")}),
+                    }),
+                }),
+            }),
+        }), "whileTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "t", try send(c, try varRef(c, "self"), "at:", &.{try varRef(c, "i")})),
+                try send(c, try varRef(c, "self"), "at:put:", &.{
+                    try varRef(c, "i"),
+                    try send(c, try varRef(c, "self"), "at:", &.{
+                        try send(c, try varRef(c, "i"), "-", &.{try litInt(c, 1)}),
+                    }),
+                }),
+                try send(c, try varRef(c, "self"), "at:put:", &.{
+                    try send(c, try varRef(c, "i"), "-", &.{try litInt(c, 1)}),
+                    try varRef(c, "t"),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "-", &.{try litInt(c, 1)})),
+            }),
+        }),
+    });
+
+    // ---- IdentityDictionary ----
+    //
+    // Like Dictionary but keys compare with == (identity), not =.
+    // Backed by parallel keys/values Arrays + a slot count; linear
+    // scans on at: / at:put:. Adequate for the small dictionaries
+    // an LLM-authored program builds keyed off oop identity (e.g.,
+    // class → method-table caches, mock dispatch tables).
+    const idict = try defineClassAndRegister(heap, g, "IdentityDictionary", g.object_class, &.{ "keys", "vals", "n" });
+
+    try defineMethod(c, idict, "init", &.{}, &.{}, &.{
+        try assignNode(c, "keys", try send(c, try varRef(c, "Array"), "new:", &.{try litInt(c, 8)})),
+        try assignNode(c, "vals", try send(c, try varRef(c, "Array"), "new:", &.{try litInt(c, 8)})),
+        try assignNode(c, "n", try litInt(c, 0)),
+        try ret(c, try varRef(c, "self")),
+    });
+    try defineMethod(c, idict, "size", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "n")),
+    });
+    try defineMethod(c, idict, "isEmpty", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "n"), "=", &.{try litInt(c, 0)})),
+    });
+
+    // IdentityDictionary>>grow
+    //   | nk nv i |
+    //   nk := Array new: keys size * 2.
+    //   nv := Array new: vals size * 2.
+    //   i := 1.
+    //   [i <= n] whileTrue: [
+    //     nk at: i put: (keys at: i). nv at: i put: (vals at: i).
+    //     i := i + 1].
+    //   keys := nk. vals := nv
+    try defineMethod(c, idict, "grow", &.{}, &.{ "nk", "nv", "i" }, &.{
+        try assignNode(c, "nk", try send(c, try varRef(c, "Array"), "new:", &.{
+            try send(c, try send(c, try varRef(c, "keys"), "size", &.{}), "*", &.{try litInt(c, 2)}),
+        })),
+        try assignNode(c, "nv", try send(c, try varRef(c, "Array"), "new:", &.{
+            try send(c, try send(c, try varRef(c, "vals"), "size", &.{}), "*", &.{try litInt(c, 2)}),
+        })),
+        try assignNode(c, "i", try litInt(c, 1)),
+        try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "i"), "<=", &.{try varRef(c, "n")}),
+        }), "whileTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "nk"), "at:put:", &.{
+                    try varRef(c, "i"), try send(c, try varRef(c, "keys"), "at:", &.{try varRef(c, "i")}),
+                }),
+                try send(c, try varRef(c, "nv"), "at:put:", &.{
+                    try varRef(c, "i"), try send(c, try varRef(c, "vals"), "at:", &.{try varRef(c, "i")}),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "+", &.{try litInt(c, 1)})),
+            }),
+        }),
+        try assignNode(c, "keys", try varRef(c, "nk")),
+        try assignNode(c, "vals", try varRef(c, "nv")),
+    });
+
+    // IdentityDictionary>>at: k put: v
+    //   | i |
+    //   i := 1.
+    //   [i <= n] whileTrue: [
+    //     (keys at: i) == k ifTrue: [vals at: i put: v. ^v].
+    //     i := i + 1].
+    //   n = keys size ifTrue: [self grow].
+    //   n := n + 1.
+    //   keys at: n put: k. vals at: n put: v.
+    //   ^v
+    try defineMethod(c, idict, "at:put:", &.{ "k", "v" }, &.{"i"}, &.{
+        try assignNode(c, "i", try litInt(c, 1)),
+        try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "i"), "<=", &.{try varRef(c, "n")}),
+        }), "whileTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try send(c, try send(c, try varRef(c, "keys"), "at:", &.{try varRef(c, "i")}), "==", &.{try varRef(c, "k")}), "ifTrue:", &.{
+                    try block(c, &.{}, &.{}, &.{
+                        try send(c, try varRef(c, "vals"), "at:put:", &.{try varRef(c, "i"), try varRef(c, "v")}),
+                        try ret(c, try varRef(c, "v")),
+                    }),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "+", &.{try litInt(c, 1)})),
+            }),
+        }),
+        try send(c, try send(c, try varRef(c, "n"), "=", &.{try send(c, try varRef(c, "keys"), "size", &.{})}), "ifTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "self"), "grow", &.{}),
+            }),
+        }),
+        try assignNode(c, "n", try send(c, try varRef(c, "n"), "+", &.{try litInt(c, 1)})),
+        try send(c, try varRef(c, "keys"), "at:put:", &.{try varRef(c, "n"), try varRef(c, "k")}),
+        try send(c, try varRef(c, "vals"), "at:put:", &.{try varRef(c, "n"), try varRef(c, "v")}),
+        try ret(c, try varRef(c, "v")),
+    });
+
+    // IdentityDictionary>>at: k ifAbsent: aBlock
+    try defineMethod(c, idict, "at:ifAbsent:", &.{ "k", "aBlock" }, &.{"i"}, &.{
+        try assignNode(c, "i", try litInt(c, 1)),
+        try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "i"), "<=", &.{try varRef(c, "n")}),
+        }), "whileTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try send(c, try send(c, try varRef(c, "keys"), "at:", &.{try varRef(c, "i")}), "==", &.{try varRef(c, "k")}), "ifTrue:", &.{
+                    try block(c, &.{}, &.{}, &.{
+                        try ret(c, try send(c, try varRef(c, "vals"), "at:", &.{try varRef(c, "i")})),
+                    }),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "+", &.{try litInt(c, 1)})),
+            }),
+        }),
+        try ret(c, try send(c, try varRef(c, "aBlock"), "value", &.{})),
+    });
+
+    // IdentityDictionary>>at: k  ^self at: k ifAbsent: [Exception new signal: 'key not found']
+    try defineMethod(c, idict, "at:", &.{"k"}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "at:ifAbsent:", &.{
+            try varRef(c, "k"),
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try send(c, try varRef(c, "Exception"), "new", &.{}), "signal:", &.{try litString(c, "key not found")}),
+            }),
+        })),
+    });
+
+    // IdentityDictionary>>includesKey: k
+    try defineMethod(c, idict, "includesKey:", &.{"k"}, &.{"i"}, &.{
+        try assignNode(c, "i", try litInt(c, 1)),
+        try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "i"), "<=", &.{try varRef(c, "n")}),
+        }), "whileTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try send(c, try send(c, try varRef(c, "keys"), "at:", &.{try varRef(c, "i")}), "==", &.{try varRef(c, "k")}), "ifTrue:", &.{
+                    try block(c, &.{}, &.{}, &.{try ret(c, try litTrue(c))}),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "+", &.{try litInt(c, 1)})),
+            }),
+        }),
+        try ret(c, try litFalse(c)),
+    });
+
+    // ---- IdentitySet ----
+    //
+    // Same shape as IdentityDictionary minus the values array.
+    const iset = try defineClassAndRegister(heap, g, "IdentitySet", g.object_class, &.{ "items", "n" });
+
+    try defineMethod(c, iset, "init", &.{}, &.{}, &.{
+        try assignNode(c, "items", try send(c, try varRef(c, "Array"), "new:", &.{try litInt(c, 8)})),
+        try assignNode(c, "n", try litInt(c, 0)),
+        try ret(c, try varRef(c, "self")),
+    });
+    try defineMethod(c, iset, "size", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "n")),
+    });
+    try defineMethod(c, iset, "isEmpty", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "n"), "=", &.{try litInt(c, 0)})),
+    });
+
+    try defineMethod(c, iset, "grow", &.{}, &.{ "ni", "i" }, &.{
+        try assignNode(c, "ni", try send(c, try varRef(c, "Array"), "new:", &.{
+            try send(c, try send(c, try varRef(c, "items"), "size", &.{}), "*", &.{try litInt(c, 2)}),
+        })),
+        try assignNode(c, "i", try litInt(c, 1)),
+        try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "i"), "<=", &.{try varRef(c, "n")}),
+        }), "whileTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "ni"), "at:put:", &.{
+                    try varRef(c, "i"), try send(c, try varRef(c, "items"), "at:", &.{try varRef(c, "i")}),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "+", &.{try litInt(c, 1)})),
+            }),
+        }),
+        try assignNode(c, "items", try varRef(c, "ni")),
+    });
+
+    try defineMethod(c, iset, "includes:", &.{"x"}, &.{"i"}, &.{
+        try assignNode(c, "i", try litInt(c, 1)),
+        try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "i"), "<=", &.{try varRef(c, "n")}),
+        }), "whileTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try send(c, try send(c, try varRef(c, "items"), "at:", &.{try varRef(c, "i")}), "==", &.{try varRef(c, "x")}), "ifTrue:", &.{
+                    try block(c, &.{}, &.{}, &.{try ret(c, try litTrue(c))}),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "+", &.{try litInt(c, 1)})),
+            }),
+        }),
+        try ret(c, try litFalse(c)),
+    });
+
+    // IdentitySet>>add: x — no-op if already present (identity semantics).
+    try defineMethod(c, iset, "add:", &.{"x"}, &.{}, &.{
+        try send(c, try send(c, try varRef(c, "self"), "includes:", &.{try varRef(c, "x")}), "ifTrue:", &.{
+            try block(c, &.{}, &.{}, &.{try ret(c, try varRef(c, "x"))}),
+        }),
+        try send(c, try send(c, try varRef(c, "n"), "=", &.{try send(c, try varRef(c, "items"), "size", &.{})}), "ifTrue:", &.{
+            try block(c, &.{}, &.{}, &.{try send(c, try varRef(c, "self"), "grow", &.{})}),
+        }),
+        try assignNode(c, "n", try send(c, try varRef(c, "n"), "+", &.{try litInt(c, 1)})),
+        try send(c, try varRef(c, "items"), "at:put:", &.{try varRef(c, "n"), try varRef(c, "x")}),
+        try ret(c, try varRef(c, "x")),
+    });
 
     _ = try defineClassAndRegister(heap, g, "TestFailure", g.exception_class, &.{});
     const test_case = try defineClassAndRegister(heap, g, "TestCase", g.object_class, &.{});
