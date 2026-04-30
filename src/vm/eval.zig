@@ -96,6 +96,34 @@ pub const RootPin = struct {
     n: u32,
 };
 
+/// CLOCK_MONOTONIC value as nanoseconds since boot. Returned as i64
+/// so it composes with deadline arithmetic and SmallInt encoding;
+/// CLOCK_MONOTONIC fits in i64 for ~292 years post-boot. On clock
+/// failure returns 0 so callers degrade to "deadline already passed"
+/// rather than aborting the scheduler.
+///
+/// Zig 0.16 dropped the `std.posix.clock_gettime` wrapper in favour
+/// of raw `std.posix.system.clock_gettime` bindings (see
+/// std/Io/Threaded.zig:11431); we follow the same pattern.
+pub fn monotonicNanos() i64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+}
+
+/// Sleep for `delta_nanos` of wall time. Returns early on signal
+/// interruption (rare in this VM) — the caller's expireSleepers
+/// retry loop handles partial sleeps.
+fn nanosleepFor(delta_nanos: i64) void {
+    if (delta_nanos <= 0) return;
+    var req: std.posix.timespec = .{
+        .sec = @intCast(@divTrunc(delta_nanos, std.time.ns_per_s)),
+        .nsec = @intCast(@mod(delta_nanos, std.time.ns_per_s)),
+    };
+    var rem: std.posix.timespec = undefined;
+    _ = std.posix.system.nanosleep(&req, &rem);
+}
+
 pub const Vm = struct {
     heap: *Heap,
     globals: Globals = .{},
@@ -362,6 +390,7 @@ pub const Vm = struct {
         object.setSlot(main, object.SLOT_PROCESS_SAVED_FRAME, oop_mod.NIL);
         object.setSlot(main, object.SLOT_PROCESS_SAVED_METHOD_FRAME, oop_mod.NIL);
         object.setSlot(main, object.SLOT_PROCESS_SAVED_METHOD_CLASS, oop_mod.NIL);
+        object.setSlot(main, object.SLOT_PROCESS_DEADLINE, oop_mod.fromInt(0));
         var main_pin: Oop = main;
         var slots: [1]?*Oop = .{&main_pin};
         var pin = RootPin{ .parent = self.root_pin, .slots = &slots, .n = 1 };
@@ -407,8 +436,10 @@ pub const Vm = struct {
     }
 
     /// Pop the head of the highest-priority non-empty runnable list.
-    /// NIL when nobody is runnable.
+    /// NIL when nobody is runnable. Drains expired sleepers off the
+    /// delay queue first so they get a chance to run.
     fn dequeueHighestRunnable(self: *Vm) Oop {
+        self.expireSleepers(monotonicNanos());
         const sched = self.globals.processor;
         if (!oop_mod.isHeapPtr(sched)) return oop_mod.NIL;
         const lists = object.slot(sched, object.SLOT_SCHEDULER_QLISTS);
@@ -427,6 +458,64 @@ pub const Vm = struct {
             return head;
         }
         return oop_mod.NIL;
+    }
+
+    /// Insert `process` into the scheduler's delay list, sorted
+    /// ascending by deadline. The list is linked through
+    /// SLOT_PROCESS_NEXT_LINK; the head is the earliest deadline.
+    pub fn delayEnqueue(self: *Vm, process: Oop) void {
+        const sched = self.globals.processor;
+        if (!oop_mod.isHeapPtr(sched)) return;
+        const dl_oop = object.slot(process, object.SLOT_PROCESS_DEADLINE);
+        if (!oop_mod.isInt(dl_oop)) return;
+        const dl = oop_mod.toInt(dl_oop);
+        object.setSlot(process, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+
+        const head = object.slot(sched, object.SLOT_SCHEDULER_DELAY_HEAD);
+        if (oop_mod.isNil(head)) {
+            object.setSlot(sched, object.SLOT_SCHEDULER_DELAY_HEAD, process);
+            return;
+        }
+        const head_dl_oop = object.slot(head, object.SLOT_PROCESS_DEADLINE);
+        if (oop_mod.isInt(head_dl_oop) and dl < oop_mod.toInt(head_dl_oop)) {
+            object.setSlot(process, object.SLOT_PROCESS_NEXT_LINK, head);
+            object.setSlot(sched, object.SLOT_SCHEDULER_DELAY_HEAD, process);
+            return;
+        }
+        // Insert after the last process whose deadline is <= ours
+        // (ties go to FIFO).
+        var cur = head;
+        while (true) {
+            const nxt = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+            if (oop_mod.isNil(nxt)) break;
+            const nxt_dl_oop = object.slot(nxt, object.SLOT_PROCESS_DEADLINE);
+            if (!oop_mod.isInt(nxt_dl_oop)) break;
+            if (dl < oop_mod.toInt(nxt_dl_oop)) break;
+            cur = nxt;
+        }
+        const after = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+        object.setSlot(process, object.SLOT_PROCESS_NEXT_LINK, after);
+        object.setSlot(cur, object.SLOT_PROCESS_NEXT_LINK, process);
+    }
+
+    /// Move every sleeping process whose deadline has passed off
+    /// the delay list and onto the runnable queue.
+    pub fn expireSleepers(self: *Vm, now: i64) void {
+        const sched = self.globals.processor;
+        if (!oop_mod.isHeapPtr(sched)) return;
+        var head = object.slot(sched, object.SLOT_SCHEDULER_DELAY_HEAD);
+        while (oop_mod.isHeapPtr(head)) {
+            const dl_oop = object.slot(head, object.SLOT_PROCESS_DEADLINE);
+            if (!oop_mod.isInt(dl_oop)) break;
+            if (oop_mod.toInt(dl_oop) > now) break;
+            const next = object.slot(head, object.SLOT_PROCESS_NEXT_LINK);
+            object.setSlot(head, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+            object.setSlot(head, object.SLOT_PROCESS_DEADLINE, oop_mod.fromInt(0));
+            object.setSlot(head, object.SLOT_PROCESS_STATE, self.globals.sym_runnable);
+            self.enqueueRunnable(head);
+            head = next;
+        }
+        object.setSlot(sched, object.SLOT_SCHEDULER_DELAY_HEAD, head);
     }
 
     /// Append a Process at the tail of its priority's runnable list.
@@ -472,7 +561,22 @@ pub const Vm = struct {
         try self.ensureMainProcess();
         const active = self.current_process;
         const active_state = object.slot(active, object.SLOT_PROCESS_STATE);
-        const next = self.dequeueHighestRunnable();
+
+        var next = self.dequeueHighestRunnable();
+        // Active is non-runnable and the run queue is empty, but
+        // some processes may still be sleeping. Block the host
+        // thread until the earliest deadline, expire, retry.
+        while (oop_mod.isNil(next) and active_state != self.globals.sym_runnable) {
+            const sched = self.globals.processor;
+            if (!oop_mod.isHeapPtr(sched)) break;
+            const head = object.slot(sched, object.SLOT_SCHEDULER_DELAY_HEAD);
+            if (!oop_mod.isHeapPtr(head)) break;
+            const dl_oop = object.slot(head, object.SLOT_PROCESS_DEADLINE);
+            if (!oop_mod.isInt(dl_oop)) break;
+            nanosleepFor(oop_mod.toInt(dl_oop) - monotonicNanos());
+            next = self.dequeueHighestRunnable();
+        }
+
         if (oop_mod.isNil(next)) {
             if (active_state != self.globals.sym_runnable) return error.PrimitiveFailed;
             return;

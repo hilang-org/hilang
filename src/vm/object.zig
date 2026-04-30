@@ -207,7 +207,10 @@ pub const SLOT_PROCESS_SUSPENDED_CONTEXT: u32 = 6;
 pub const SLOT_PROCESS_SAVED_FRAME: u32 = 7;
 pub const SLOT_PROCESS_SAVED_METHOD_FRAME: u32 = 8;
 pub const SLOT_PROCESS_SAVED_METHOD_CLASS: u32 = 9;
-pub const PROCESS_INST_SIZE: u32 = 10;
+// Monotonic-clock deadline (nanoseconds) when this process is on
+// the scheduler's delay list. SmallInt; 0 means "not waiting".
+pub const SLOT_PROCESS_DEADLINE: u32 = 10;
+pub const PROCESS_INST_SIZE: u32 = 11;
 
 // Semaphore { count, waitersHead, waitersTail }
 //   count        — SmallInt; signal increments, wait decrements when > 0.
@@ -226,7 +229,11 @@ pub const SEMA_INST_SIZE: u32 = 3;
 //                     processes have been forked yet.
 pub const SLOT_SCHEDULER_QLISTS: u32 = 0;
 pub const SLOT_SCHEDULER_ACTIVE: u32 = 1;
-pub const SCHEDULER_INST_SIZE: u32 = 2;
+// Head of the sorted-by-deadline list of sleeping processes.
+// Linked through SLOT_PROCESS_NEXT_LINK; head is the earliest
+// deadline. NIL when no process is currently delayed.
+pub const SLOT_SCHEDULER_DELAY_HEAD: u32 = 2;
+pub const SCHEDULER_INST_SIZE: u32 = 3;
 
 // Smalltalk priority bands match the Pharo defaults; index 0 is unused
 // so user-facing priorities read 1..7.

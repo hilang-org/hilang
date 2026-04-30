@@ -418,3 +418,233 @@ test "suspended Process survives GC during another's run" {
     );
     try std.testing.expectEqual(@as(i64, 5), vm.oop.toInt(got));
 }
+
+test "Mutex serialises critical sections across forks" {
+    // Two workers each enter `mutex critical: [log addLast: 'X1'.
+    // Processor yield. log addLast: 'X2']`. Without the mutex the
+    // yield interleaves the two halves; with it the second worker
+    // blocks on the underlying semaphore and runs only after the
+    // first releases. Expected log: ['A1','A2','B1','B2'].
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"MutLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"TheMutex"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Mutex"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"TheMutex"},"selector":"critical:","args":[
+        \\    {"block":{"params":[],"temps":[],"body":[
+        \\      {"send":{"receiver":{"var_ref":"MutLog"},"selector":"addLast:","args":[{"literal":{"string":"A1"}}]}},
+        \\      {"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}},
+        \\      {"send":{"receiver":{"var_ref":"MutLog"},"selector":"addLast:","args":[{"literal":{"string":"A2"}}]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"TheMutex"},"selector":"critical:","args":[
+        \\    {"block":{"params":[],"temps":[],"body":[
+        \\      {"send":{"receiver":{"var_ref":"MutLog"},"selector":"addLast:","args":[{"literal":{"string":"B1"}}]}},
+        \\      {"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}},
+        \\      {"send":{"receiver":{"var_ref":"MutLog"},"selector":"addLast:","args":[{"literal":{"string":"B2"}}]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    // Drive the schedule. 6 yields is comfortably more than enough
+    // to drain both workers; surplus yields stay on the same active.
+    var i: u32 = 0;
+    while (i < 6) : (i += 1) {
+        _ = try env.evalJson(
+            \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+        );
+    }
+
+    const size = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"MutLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 4), vm.oop.toInt(size));
+
+    // Order: each worker's two halves are adjacent. Pre-mutex the
+    // yield would split them — we'd see ABAB or similar.
+    const e0 = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"MutLog"},"selector":"at:","args":[{"literal":{"int":1}}]}}
+    );
+    const e1 = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"MutLog"},"selector":"at:","args":[{"literal":{"int":2}}]}}
+    );
+    // First two entries must share a prefix letter (both 'A' or both 'B').
+    const c0 = vm.object.bytesOf(e0)[0];
+    const c1 = vm.object.bytesOf(e1)[0];
+    try std.testing.expectEqual(c0, c1);
+}
+
+test "Mutex is reentrant in the same Process" {
+    // Without the owner-fast-path, a second `critical:` from the
+    // same process would deadlock on its own semaphore — surfaced
+    // as PrimitiveFailed (no other runnable to schedule).
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"ReLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"ReMtx"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Mutex"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+
+    // ReMtx critical: [
+    //   ReLog addLast: 'outer-pre'.
+    //   ReMtx critical: [ReLog addLast: 'inner'].
+    //   ReLog addLast: 'outer-post']
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"ReMtx"},"selector":"critical:","args":[
+        \\  {"block":{"params":[],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"ReLog"},"selector":"addLast:","args":[{"literal":{"string":"outer-pre"}}]}},
+        \\    {"send":{"receiver":{"var_ref":"ReMtx"},"selector":"critical:","args":[
+        \\      {"block":{"params":[],"temps":[],"body":[
+        \\        {"send":{"receiver":{"var_ref":"ReLog"},"selector":"addLast:","args":[{"literal":{"string":"inner"}}]}}
+        \\      ]}}
+        \\    ]}},
+        \\    {"send":{"receiver":{"var_ref":"ReLog"},"selector":"addLast:","args":[{"literal":{"string":"outer-post"}}]}}
+        \\  ]}}
+        \\]}}
+    );
+
+    const size = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"ReLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 3), vm.oop.toInt(size));
+}
+
+test "SharedQueue producer/consumer round-trip" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"TheQ"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"SharedQueue"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+
+    // Producer: nextPut: 1, 2, 3.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"TheQ"},"selector":"nextPut:","args":[{"literal":{"int":1}}]}},
+        \\  {"send":{"receiver":{"var_ref":"TheQ"},"selector":"nextPut:","args":[{"literal":{"int":2}}]}},
+        \\  {"send":{"receiver":{"var_ref":"TheQ"},"selector":"nextPut:","args":[{"literal":{"int":3}}]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    // Yield so the producer runs and fills the queue (and signals
+    // `available` 3 times).
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+
+    // 1 + 2*10 + 3*100 = 321 — proves FIFO order.
+    const result = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"send":{"receiver":{"var_ref":"TheQ"},"selector":"next","args":[]}},
+        \\  "selector":"+","args":[{"send":{"receiver":{"send":{"receiver":{"var_ref":"TheQ"},"selector":"next","args":[]}},
+        \\    "selector":"*","args":[{"literal":{"int":10}}]}}]}},
+        \\  "selector":"+","args":[{"send":{"receiver":{"send":{"receiver":{"var_ref":"TheQ"},"selector":"next","args":[]}},
+        \\    "selector":"*","args":[{"literal":{"int":100}}]}}]}}
+    );
+    try std.testing.expectEqual(@as(i64, 321), vm.oop.toInt(result));
+}
+
+test "Delay wait blocks at least N nanoseconds" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // 5 ms is short enough not to drag CI; long enough to dwarf
+    // any nanosleep granularity (typically <1 ms). Stash t0 in
+    // the Smalltalk dict so we can compute the delta after the
+    // delay returns.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"DelT0"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Time"},"selector":"monotonicNanos","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"Delay"},"selector":"forMilliseconds:","args":[{"literal":{"int":5}}]}},
+        \\  "selector":"wait","args":[]}}
+    );
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"Time"},"selector":"monotonicNanos","args":[]}},
+        \\  "selector":"-","args":[{"var_ref":"DelT0"}]}}
+    );
+    const elapsed = vm.oop.toInt(got);
+    try std.testing.expect(elapsed >= 5_000_000);
+    // Sanity upper bound — under 1 s would catch a runaway sleep.
+    try std.testing.expect(elapsed < 1_000_000_000);
+}
+
+test "Delay does not block the whole VM" {
+    // A worker waits on a Delay. Main waits on a semaphore that
+    // the worker signals after the delay returns. The fact that
+    // the test completes proves expireSleepers re-queued the
+    // worker — without that, main blocks forever on the
+    // semaphore (its scheduleNext sees an empty run queue and an
+    // unattended delay queue → nanosleep → expire → wake worker
+    // → worker signals → main resumes). 5 ms keeps the wall
+    // clock cheap.
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"DoneSem"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Semaphore"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Delay"},"selector":"forMilliseconds:","args":[{"literal":{"int":5}}]}},"selector":"wait","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"DoneSem"},"selector":"signal","args":[]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"DelT0b"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Time"},"selector":"monotonicNanos","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"DoneSem"},"selector":"wait","args":[]}}
+    );
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"Time"},"selector":"monotonicNanos","args":[]}},
+        \\  "selector":"-","args":[{"var_ref":"DelT0b"}]}}
+    );
+    const elapsed = vm.oop.toInt(got);
+    try std.testing.expect(elapsed >= 5_000_000);
+    try std.testing.expect(elapsed < 1_000_000_000);
+}

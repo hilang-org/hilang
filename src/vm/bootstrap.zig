@@ -337,6 +337,18 @@ pub fn bootstrap(heap: *Heap) !Globals {
     try installPrim(heap, &g, g.scheduler_class, "yield", 0, prims.PRIM_PROCESSOR_YIELD);
     try installPrim(heap, &g, g.scheduler_class, "activeProcess", 0, prims.PRIM_PROCESSOR_ACTIVE);
 
+    // Time class>>monotonicNanos and Delay>>wait — both surfaced
+    // by stdlib's loadConcurrency, primitives installed here.
+    const time_cls = dict_mod.lookup(g.smalltalk, "Time");
+    if (oop_mod.isHeapPtr(time_cls)) {
+        const time_meta = object.headerOf(time_cls).class;
+        try installPrim(heap, &g, time_meta, "monotonicNanos", 0, prims.PRIM_TIME_MONO_NANOS);
+    }
+    const delay_cls = dict_mod.lookup(g.smalltalk, "Delay");
+    if (oop_mod.isHeapPtr(delay_cls)) {
+        try installPrim(heap, &g, delay_cls, "wait", 0, prims.PRIM_DELAY_WAIT);
+    }
+
     // Seal the image header so a second bootstrap attempt fails fast,
     // and a future image loader can find Smalltalk without scanning.
     const hdr = heap.imageHeader();

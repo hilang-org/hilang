@@ -111,6 +111,8 @@ pub const PRIM_PROCESS_SUSPEND: u32 = 221;
 pub const PRIM_PROCESS_TERMINATE: u32 = 222;
 pub const PRIM_PROCESSOR_YIELD: u32 = 230;
 pub const PRIM_PROCESSOR_ACTIVE: u32 = 231;
+pub const PRIM_TIME_MONO_NANOS: u32 = 240;
+pub const PRIM_DELAY_WAIT: u32 = 241;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -201,6 +203,8 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_PROCESS_TERMINATE => primProcessTerminate(vm, receiver, args),
         PRIM_PROCESSOR_YIELD => primProcessorYield(vm, receiver, args),
         PRIM_PROCESSOR_ACTIVE => primProcessorActive(vm, receiver, args),
+        PRIM_TIME_MONO_NANOS => primTimeMonoNanos(vm, receiver, args),
+        PRIM_DELAY_WAIT => primDelayWait(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1118,6 +1122,7 @@ fn newProcess(vm: *Vm, block: Oop, priority: i64) PrimError!Oop {
     object.setSlot(p, object.SLOT_PROCESS_SAVED_FRAME, oop_mod.NIL);
     object.setSlot(p, object.SLOT_PROCESS_SAVED_METHOD_FRAME, oop_mod.NIL);
     object.setSlot(p, object.SLOT_PROCESS_SAVED_METHOD_CLASS, oop_mod.NIL);
+    object.setSlot(p, object.SLOT_PROCESS_DEADLINE, oop_mod.fromInt(0));
     return p;
 }
 
@@ -1301,4 +1306,35 @@ fn primProcessorActive(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     if (args.len != 0) return error.ArityMismatch;
     if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
     return object.slot(receiver, object.SLOT_SCHEDULER_ACTIVE);
+}
+
+// Time monotonicNanos — current CLOCK_MONOTONIC value as a SmallInt.
+// Receiver irrelevant; this is a class-side / static-style primitive.
+fn primTimeMonoNanos(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    const nanos = eval_mod.monotonicNanos();
+    if (!oop_mod.fitsSmallInt(nanos)) return error.PrimitiveFailed;
+    return oop_mod.fromInt(nanos);
+}
+
+// Delay>>wait — park the active Process on the scheduler's sorted
+// delay list using the receiver's deadlineNanos ivar (slot 0), then
+// hand control to the next runnable. When this returns we've been
+// re-enqueued by the scheduler's expireSleepers walk.
+fn primDelayWait(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const dl_oop = object.slot(receiver, 0);
+    if (!oop_mod.isInt(dl_oop)) return error.TypeError;
+
+    try vm.ensureMainProcess();
+    const active = vm.current_process;
+    object.setSlot(active, object.SLOT_PROCESS_DEADLINE, dl_oop);
+    object.setSlot(active, object.SLOT_PROCESS_STATE, vm.globals.sym_waiting);
+    vm.delayEnqueue(active);
+
+    // Hand off; when scheduleNext eventually returns to us our
+    // deadline has already passed and expireSleepers re-queued us.
+    try vm.scheduleNext();
+    return oop_mod.NIL;
 }

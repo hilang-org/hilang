@@ -2053,6 +2053,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
             "priority", "state",     "block",      "name",
             "nextLink", "result",    "suspendedContext",
             "savedFrame", "savedMethodFrame", "savedMethodClass",
+            "deadline",
         },
     );
     g.process_class = process_class;
@@ -2121,7 +2122,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
         g,
         "ProcessorScheduler",
         g.object_class,
-        &.{ "quiescentLists", "activeProcess" },
+        &.{ "quiescentLists", "activeProcess", "delayHead" },
     );
     g.scheduler_class = scheduler_class;
 
@@ -2149,6 +2150,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
     }
     object.setSlot(processor, object.SLOT_SCHEDULER_QLISTS, qlists);
     object.setSlot(processor, object.SLOT_SCHEDULER_ACTIVE, oop_mod.NIL);
+    object.setSlot(processor, object.SLOT_SCHEDULER_DELAY_HEAD, oop_mod.NIL);
     g.processor = processor;
     _ = try dict.atPut(heap, g.smalltalk, g, "Processor", processor);
 
@@ -2159,4 +2161,185 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
     _ = try dict.atPut(heap, g.smalltalk, g, "PriorityLowIO", oop_mod.fromInt(object.PRIORITY_LOW_IO));
     _ = try dict.atPut(heap, g.smalltalk, g, "PriorityHighIO", oop_mod.fromInt(object.PRIORITY_HIGH_IO));
     _ = try dict.atPut(heap, g.smalltalk, g, "PriorityTiming", oop_mod.fromInt(object.PRIORITY_TIMING));
+
+    // ---- Mutex ----
+    //
+    // Reentrant mutual exclusion built atop a binary Semaphore. Owner
+    // tracking lets the same Process re-enter `critical:` without
+    // deadlocking; a counter tracks nesting depth so only the
+    // outermost release signals the semaphore.
+    const mutex_class = try defineClassAndRegister(
+        heap,
+        g,
+        "Mutex",
+        g.object_class,
+        &.{ "semaphore", "owner", "count" },
+    );
+
+    // Mutex>>init  semaphore := Semaphore new init signal. owner := nil. count := 0. ^self
+    try defineMethod(c, mutex_class, "init", &.{}, &.{}, &.{
+        try assignNode(c, "semaphore", try send(c, try send(c, try send(c, try varRef(c, "Semaphore"), "new", &.{}), "init", &.{}), "signal", &.{})),
+        try assignNode(c, "owner", try litNil(c)),
+        try assignNode(c, "count", try litInt(c, 0)),
+        try ret(c, try varRef(c, "self")),
+    });
+
+    // Mutex>>critical: aBlock
+    //   | active |
+    //   active := Processor activeProcess.
+    //   owner == active ifTrue: [
+    //     count := count + 1.
+    //     ^[aBlock value] ensure: [count := count - 1]].
+    //   semaphore wait.
+    //   owner := active. count := 1.
+    //   ^[aBlock value] ensure: [
+    //     count := count - 1.
+    //     count = 0 ifTrue: [owner := nil. semaphore signal]]
+    try defineMethod(c, mutex_class, "critical:", &.{"aBlock"}, &.{"active"}, &.{
+        try assignNode(c, "active", try send(c, try varRef(c, "Processor"), "activeProcess", &.{})),
+        try send(c, try send(c, try varRef(c, "owner"), "==", &.{try varRef(c, "active")}), "ifTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "count", try send(c, try varRef(c, "count"), "+", &.{try litInt(c, 1)})),
+                try ret(c, try send(c, try block(c, &.{}, &.{}, &.{
+                    try send(c, try varRef(c, "aBlock"), "value", &.{}),
+                }), "ensure:", &.{
+                    try block(c, &.{}, &.{}, &.{
+                        try assignNode(c, "count", try send(c, try varRef(c, "count"), "-", &.{try litInt(c, 1)})),
+                    }),
+                })),
+            }),
+        }),
+        try send(c, try varRef(c, "semaphore"), "wait", &.{}),
+        try assignNode(c, "owner", try varRef(c, "active")),
+        try assignNode(c, "count", try litInt(c, 1)),
+        try ret(c, try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "aBlock"), "value", &.{}),
+        }), "ensure:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "count", try send(c, try varRef(c, "count"), "-", &.{try litInt(c, 1)})),
+                try send(c, try send(c, try varRef(c, "count"), "=", &.{try litInt(c, 0)}), "ifTrue:", &.{
+                    try block(c, &.{}, &.{}, &.{
+                        try assignNode(c, "owner", try litNil(c)),
+                        try send(c, try varRef(c, "semaphore"), "signal", &.{}),
+                    }),
+                }),
+            }),
+        })),
+    });
+
+    try defineMethod(c, mutex_class, "owner", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "owner")),
+    });
+    try defineMethod(c, mutex_class, "count", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "count")),
+    });
+
+    // ---- SharedQueue ----
+    //
+    // Producer/consumer queue. `available` is the count of buffered
+    // items; `mutex` serialises mutations of the underlying
+    // OrderedCollection.
+    const shared_queue_class = try defineClassAndRegister(
+        heap,
+        g,
+        "SharedQueue",
+        g.object_class,
+        &.{ "items", "mutex", "available" },
+    );
+
+    // SharedQueue>>init
+    //   items := OrderedCollection new init.
+    //   mutex := Mutex new init.
+    //   available := Semaphore new init.   "count = 0"
+    //   ^self
+    try defineMethod(c, shared_queue_class, "init", &.{}, &.{}, &.{
+        try assignNode(c, "items", try send(c, try send(c, try varRef(c, "OrderedCollection"), "new", &.{}), "init", &.{})),
+        try assignNode(c, "mutex", try send(c, try send(c, try varRef(c, "Mutex"), "new", &.{}), "init", &.{})),
+        try assignNode(c, "available", try send(c, try send(c, try varRef(c, "Semaphore"), "new", &.{}), "init", &.{})),
+        try ret(c, try varRef(c, "self")),
+    });
+
+    // SharedQueue>>nextPut: anObject
+    //   mutex critical: [items addLast: anObject].
+    //   available signal. ^anObject
+    try defineMethod(c, shared_queue_class, "nextPut:", &.{"anObject"}, &.{}, &.{
+        try send(c, try varRef(c, "mutex"), "critical:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "items"), "addLast:", &.{try varRef(c, "anObject")}),
+            }),
+        }),
+        try send(c, try varRef(c, "available"), "signal", &.{}),
+        try ret(c, try varRef(c, "anObject")),
+    });
+
+    // SharedQueue>>next
+    //   available wait.
+    //   ^mutex critical: [items removeFirst]
+    try defineMethod(c, shared_queue_class, "next", &.{}, &.{}, &.{
+        try send(c, try varRef(c, "available"), "wait", &.{}),
+        try ret(c, try send(c, try varRef(c, "mutex"), "critical:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "items"), "removeFirst", &.{}),
+            }),
+        })),
+    });
+
+    // SharedQueue>>size  ^mutex critical: [items size]
+    try defineMethod(c, shared_queue_class, "size", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "mutex"), "critical:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "items"), "size", &.{}),
+            }),
+        })),
+    });
+
+    // SharedQueue>>isEmpty  ^self size = 0
+    try defineMethod(c, shared_queue_class, "isEmpty", &.{}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "size", &.{}), "=", &.{try litInt(c, 0)})),
+    });
+
+    // ---- Time ----
+    //
+    // Tiny utility class. Class-side `monotonicNanos` is wired as a
+    // primitive in bootstrap.zig (no metaclass plumbing in stdlib).
+    const time_class = try defineClassAndRegister(heap, g, "Time", g.object_class, &.{});
+    _ = time_class;
+
+    // ---- Delay ----
+    //
+    // Cooperative timed wait. `wait` is a primitive that parks the
+    // active Process on the scheduler's sorted delay queue using
+    // the receiver's deadlineNanos ivar (slot 0); the scheduler's
+    // expireSleepers walks it on every yield/wait/signal point.
+    const delay_class = try defineClassAndRegister(
+        heap,
+        g,
+        "Delay",
+        g.object_class,
+        &.{"deadlineNanos"},
+    );
+
+    try defineMethod(c, delay_class, "setDeadlineNanos:", &.{"n"}, &.{}, &.{
+        try assignNode(c, "deadlineNanos", try varRef(c, "n")),
+        try ret(c, try varRef(c, "self")),
+    });
+    try defineMethod(c, delay_class, "deadlineNanos", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "deadlineNanos")),
+    });
+
+    // Delay class>>forMilliseconds: ms  ^self new setDeadlineNanos: Time monotonicNanos + (ms * 1000000)
+    const delay_meta = object.headerOf(delay_class).class;
+    try defineMethod(c, delay_meta, "forMilliseconds:", &.{"ms"}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "setDeadlineNanos:", &.{
+            try send(c, try send(c, try varRef(c, "Time"), "monotonicNanos", &.{}), "+", &.{
+                try send(c, try varRef(c, "ms"), "*", &.{try litInt(c, 1_000_000)}),
+            }),
+        })),
+    });
+    // Delay class>>forSeconds: s  ^self forMilliseconds: s * 1000
+    try defineMethod(c, delay_meta, "forSeconds:", &.{"s"}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "forMilliseconds:", &.{
+            try send(c, try varRef(c, "s"), "*", &.{try litInt(c, 1_000)}),
+        })),
+    });
 }
