@@ -2023,3 +2023,136 @@ pub fn loadSUnit(heap: *Heap, g: *Globals) !void {
         }),
     });
 }
+
+// Concurrency surface: Process, Semaphore, ProcessorScheduler, plus
+// the Processor singleton bound in the Smalltalk dictionary. Methods
+// that need raw VM state (fork, wait, signal, yield, ...) are
+// installed as primitives by the bootstrap; the rest are AST methods
+// here. Semantics today are placeholder-cooperative — no real
+// stack switching yet — but the public protocol matches classic
+// Smalltalk so the eventual scheduler doesn't change the surface.
+pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
+    const c = Ctx{ .heap = heap, .g = g };
+
+    // Pre-intern state symbols. The fork/wait/signal primitives store
+    // these directly into Process.state and read them back, so caching
+    // a single canonical Oop per state keeps the dispatch path off
+    // newSymbol on the hot path.
+    g.sym_runnable = try dict.newSymbol(heap, g, "runnable");
+    g.sym_suspended = try dict.newSymbol(heap, g, "suspended");
+    g.sym_waiting = try dict.newSymbol(heap, g, "waiting");
+    g.sym_terminated = try dict.newSymbol(heap, g, "terminated");
+
+    // ---- Process ----
+    const process_class = try defineClassAndRegister(
+        heap,
+        g,
+        "Process",
+        g.object_class,
+        &.{ "priority", "state", "block", "name", "nextLink", "result", "suspendedContext" },
+    );
+    g.process_class = process_class;
+
+    try defineMethod(c, process_class, "priority", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "priority")),
+    });
+    try defineMethod(c, process_class, "state", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "state")),
+    });
+    try defineMethod(c, process_class, "name", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "name")),
+    });
+    try defineMethod(c, process_class, "name:", &.{"aName"}, &.{}, &.{
+        try assignNode(c, "name", try varRef(c, "aName")),
+        try ret(c, try varRef(c, "self")),
+    });
+    try defineMethod(c, process_class, "isTerminated", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "state"), "==", &.{try lit(c, g.sym_terminated)})),
+    });
+
+    // ---- Semaphore ----
+    const semaphore_class = try defineClassAndRegister(
+        heap,
+        g,
+        "Semaphore",
+        g.object_class,
+        &.{ "count", "waitersHead", "waitersTail" },
+    );
+    g.semaphore_class = semaphore_class;
+
+    // Semaphore>>init  count := 0. waitersHead := nil. waitersTail := nil. ^self
+    try defineMethod(c, semaphore_class, "init", &.{}, &.{}, &.{
+        try assignNode(c, "count", try litInt(c, 0)),
+        try assignNode(c, "waitersHead", try litNil(c)),
+        try assignNode(c, "waitersTail", try litNil(c)),
+        try ret(c, try varRef(c, "self")),
+    });
+
+    // Semaphore class>>forMutualExclusion  ^self new init signal
+    const sema_meta = object.headerOf(semaphore_class).class;
+    try defineMethod(c, sema_meta, "forMutualExclusion", &.{}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "init", &.{}), "signal", &.{})),
+    });
+
+    // Semaphore>>critical: aBlock
+    //   self wait. ^[aBlock value] ensure: [self signal]
+    try defineMethod(c, semaphore_class, "critical:", &.{"aBlock"}, &.{}, &.{
+        try send(c, try varRef(c, "self"), "wait", &.{}),
+        try ret(c, try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "aBlock"), "value", &.{}),
+        }), "ensure:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "self"), "signal", &.{}),
+            }),
+        })),
+    });
+
+    try defineMethod(c, semaphore_class, "count", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "count")),
+    });
+
+    // ---- ProcessorScheduler ----
+    const scheduler_class = try defineClassAndRegister(
+        heap,
+        g,
+        "ProcessorScheduler",
+        g.object_class,
+        &.{ "quiescentLists", "activeProcess" },
+    );
+    g.scheduler_class = scheduler_class;
+
+    // ProcessorScheduler>>init  quiescentLists := Array new: 7. activeProcess := nil. ^self
+    try defineMethod(c, scheduler_class, "init", &.{}, &.{}, &.{
+        try assignNode(c, "quiescentLists", try send(c, try varRef(c, "Array"), "new:", &.{
+            try litInt(c, @intCast(object.MAX_PRIORITY)),
+        })),
+        try assignNode(c, "activeProcess", try litNil(c)),
+        try ret(c, try varRef(c, "self")),
+    });
+
+    // ProcessorScheduler>>quiescentLists / activeProcess accessors —
+    // mostly for inspection from tests and printers.
+    try defineMethod(c, scheduler_class, "quiescentLists", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "quiescentLists")),
+    });
+
+    // Build the Processor singleton instance and bind it in Smalltalk.
+    const processor = try heap.allocSlots(scheduler_class, object.SCHEDULER_INST_SIZE);
+    const qlists = try heap.allocSlots(g.array_class, object.MAX_PRIORITY);
+    var i: u32 = 0;
+    while (i < object.MAX_PRIORITY) : (i += 1) {
+        object.setSlot(qlists, i, oop_mod.NIL);
+    }
+    object.setSlot(processor, object.SLOT_SCHEDULER_QLISTS, qlists);
+    object.setSlot(processor, object.SLOT_SCHEDULER_ACTIVE, oop_mod.NIL);
+    g.processor = processor;
+    _ = try dict.atPut(heap, g.smalltalk, g, "Processor", processor);
+
+    // Priority constants in the Smalltalk dict.
+    _ = try dict.atPut(heap, g.smalltalk, g, "PriorityUserBackground", oop_mod.fromInt(object.PRIORITY_USER_BACKGROUND));
+    _ = try dict.atPut(heap, g.smalltalk, g, "PriorityUserScheduling", oop_mod.fromInt(object.PRIORITY_USER_SCHEDULING));
+    _ = try dict.atPut(heap, g.smalltalk, g, "PriorityUserInterrupt", oop_mod.fromInt(object.PRIORITY_USER_INTERRUPT));
+    _ = try dict.atPut(heap, g.smalltalk, g, "PriorityLowIO", oop_mod.fromInt(object.PRIORITY_LOW_IO));
+    _ = try dict.atPut(heap, g.smalltalk, g, "PriorityHighIO", oop_mod.fromInt(object.PRIORITY_HIGH_IO));
+    _ = try dict.atPut(heap, g.smalltalk, g, "PriorityTiming", oop_mod.fromInt(object.PRIORITY_TIMING));
+}

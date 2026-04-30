@@ -47,6 +47,22 @@ pub const Globals = struct {
 
     exception_class: Oop = oop_mod.NIL,
 
+    // Concurrency classes (loaded after the kernel is wired so their
+    // metaclass parents already exist). The Processor singleton —
+    // an instance of ProcessorScheduler — is bound in `Smalltalk`
+    // under the name "Processor".
+    process_class: Oop = oop_mod.NIL,
+    semaphore_class: Oop = oop_mod.NIL,
+    scheduler_class: Oop = oop_mod.NIL,
+    processor: Oop = oop_mod.NIL,
+
+    // Pre-interned state symbols — read by Vm.invokeBlock's fork path
+    // and by the wait/signal primitives.
+    sym_runnable: Oop = oop_mod.NIL,
+    sym_suspended: Oop = oop_mod.NIL,
+    sym_waiting: Oop = oop_mod.NIL,
+    sym_terminated: Oop = oop_mod.NIL,
+
     // The SystemDictionary instance, conventionally bound to `Smalltalk`.
     smalltalk: Oop = oop_mod.NIL,
 

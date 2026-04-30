@@ -7,4 +7,5 @@ comptime {
     _ = @import("test_math.zig");
     _ = @import("test_blocks.zig");
     _ = @import("test_warmup.zig");
+    _ = @import("test_concurrency.zig");
 }

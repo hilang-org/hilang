@@ -322,6 +322,21 @@ pub fn bootstrap(heap: *Heap) !Globals {
     const stdlib_mod = @import("stdlib.zig");
     try stdlib_mod.loadSUnit(heap, &g);
 
+    // ---- Phase 10: concurrency (Process / Semaphore / Processor). ----
+    //
+    // Surface ships now; cooperative scheduler with native stack
+    // switching follows in subsequent commits.
+    try stdlib_mod.loadConcurrency(heap, &g);
+    try installPrim(heap, &g, g.block_closure_class, "fork", 0, prims.PRIM_BLOCK_FORK);
+    try installPrim(heap, &g, g.block_closure_class, "forkAt:", 1, prims.PRIM_BLOCK_FORK_AT);
+    try installPrim(heap, &g, g.semaphore_class, "wait", 0, prims.PRIM_SEMAPHORE_WAIT);
+    try installPrim(heap, &g, g.semaphore_class, "signal", 0, prims.PRIM_SEMAPHORE_SIGNAL);
+    try installPrim(heap, &g, g.process_class, "resume", 0, prims.PRIM_PROCESS_RESUME);
+    try installPrim(heap, &g, g.process_class, "suspend", 0, prims.PRIM_PROCESS_SUSPEND);
+    try installPrim(heap, &g, g.process_class, "terminate", 0, prims.PRIM_PROCESS_TERMINATE);
+    try installPrim(heap, &g, g.scheduler_class, "yield", 0, prims.PRIM_PROCESSOR_YIELD);
+    try installPrim(heap, &g, g.scheduler_class, "activeProcess", 0, prims.PRIM_PROCESSOR_ACTIVE);
+
     // Seal the image header so a second bootstrap attempt fails fast,
     // and a future image loader can find Smalltalk without scanning.
     const hdr = heap.imageHeader();

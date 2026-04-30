@@ -95,6 +95,23 @@ pub const PRIM_FLOAT_COS: u32 = 142;
 pub const PRIM_FLOAT_LN: u32 = 143;
 pub const PRIM_FLOAT_EXP: u32 = 144;
 
+// ---- Concurrency. Surface only — semantics are placeholder-cooperative
+// until the context-switch backend lands. fork allocates a Process and
+// links it into the scheduler's runnable list; signal/wait operate on
+// the count and waiter list synchronously; yield/resume/suspend mark
+// state ivars without actually transferring control. The shape mirrors
+// classic Smalltalk so once swapcontext-style switching ships in a
+// later commit, the public methods don't need to change. ----
+pub const PRIM_BLOCK_FORK: u32 = 200;
+pub const PRIM_BLOCK_FORK_AT: u32 = 201;
+pub const PRIM_SEMAPHORE_WAIT: u32 = 210;
+pub const PRIM_SEMAPHORE_SIGNAL: u32 = 211;
+pub const PRIM_PROCESS_RESUME: u32 = 220;
+pub const PRIM_PROCESS_SUSPEND: u32 = 221;
+pub const PRIM_PROCESS_TERMINATE: u32 = 222;
+pub const PRIM_PROCESSOR_YIELD: u32 = 230;
+pub const PRIM_PROCESSOR_ACTIVE: u32 = 231;
+
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
         PRIM_INT_ADD => primIntAdd(vm, receiver, args),
@@ -175,6 +192,15 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_FLOAT_COS => primFloatMath(vm, receiver, args, .cos),
         PRIM_FLOAT_LN => primFloatMath(vm, receiver, args, .ln),
         PRIM_FLOAT_EXP => primFloatMath(vm, receiver, args, .exp),
+        PRIM_BLOCK_FORK => primBlockFork(vm, receiver, args, null),
+        PRIM_BLOCK_FORK_AT => primBlockFork(vm, receiver, args, .from_arg),
+        PRIM_SEMAPHORE_WAIT => primSemaphoreWait(vm, receiver, args),
+        PRIM_SEMAPHORE_SIGNAL => primSemaphoreSignal(vm, receiver, args),
+        PRIM_PROCESS_RESUME => primProcessResume(vm, receiver, args),
+        PRIM_PROCESS_SUSPEND => primProcessSuspend(vm, receiver, args),
+        PRIM_PROCESS_TERMINATE => primProcessTerminate(vm, receiver, args),
+        PRIM_PROCESSOR_YIELD => primProcessorYield(vm, receiver, args),
+        PRIM_PROCESSOR_ACTIVE => primProcessorActive(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1068,4 +1094,168 @@ fn primFloatMath(_: *Vm, receiver: Oop, args: []const Oop, op: FloatMathOp) Prim
         .exp => @exp(x),
     };
     return oop_mod.fromF64(y);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Concurrency primitives. The semantics here are deliberately
+// placeholder-cooperative: there is no preemption yet, no native
+// stack switching, and `wait` cannot actually block. Each prim
+// performs the *bookkeeping* that the real scheduler will hook into
+// once it lands. Once context switching ships, fork/wait/yield will
+// transfer control without changing their public contract.
+// ─────────────────────────────────────────────────────────────────────
+
+fn newProcess(vm: *Vm, block: Oop, priority: i64) PrimError!Oop {
+    if (oop_mod.isNil(vm.globals.process_class)) return error.NotImplemented;
+    const p = try vm.heap.allocSlots(vm.globals.process_class, object.PROCESS_INST_SIZE);
+    object.setSlot(p, object.SLOT_PROCESS_PRIORITY, oop_mod.fromInt(priority));
+    object.setSlot(p, object.SLOT_PROCESS_STATE, vm.globals.sym_runnable);
+    object.setSlot(p, object.SLOT_PROCESS_BLOCK, block);
+    object.setSlot(p, object.SLOT_PROCESS_NAME, oop_mod.NIL);
+    object.setSlot(p, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+    object.setSlot(p, object.SLOT_PROCESS_RESULT, oop_mod.NIL);
+    object.setSlot(p, object.SLOT_PROCESS_SUSPENDED_CONTEXT, oop_mod.NIL);
+    return p;
+}
+
+// Append a Process onto the scheduler's runnable list for its priority.
+// Without preemption we never *pop* from these lists — the bookkeeping
+// is here so a future scheduler can find every forked process.
+fn schedulerEnqueue(vm: *Vm, process: Oop) void {
+    const sched = vm.globals.processor;
+    if (!oop_mod.isHeapPtr(sched)) return;
+    const lists = object.slot(sched, object.SLOT_SCHEDULER_QLISTS);
+    if (!oop_mod.isHeapPtr(lists)) return;
+    const pri_oop = object.slot(process, object.SLOT_PROCESS_PRIORITY);
+    if (!oop_mod.isInt(pri_oop)) return;
+    const pri: usize = @intCast(@max(@as(i64, 1), @min(@as(i64, object.MAX_PRIORITY), oop_mod.toInt(pri_oop))));
+    if (pri >= object.headerOf(lists).size) return;
+    // Insert at tail by walking. Lists are short in practice (one per
+    // priority) so a linear walk is fine; a doubly-linked list with a
+    // tail pointer can come later if profiling demands it.
+    object.setSlot(process, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+    const head = object.slot(lists, @intCast(pri));
+    if (oop_mod.isNil(head)) {
+        object.setSlot(lists, @intCast(pri), process);
+        return;
+    }
+    var cur = head;
+    while (true) {
+        const nxt = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+        if (oop_mod.isNil(nxt)) break;
+        cur = nxt;
+    }
+    object.setSlot(cur, object.SLOT_PROCESS_NEXT_LINK, process);
+}
+
+const ForkPriorityMode = enum { from_arg };
+
+// BlockClosure>>fork  →  prim creates a Process at the default priority,
+// links it into the runnable list, and returns the Process. The block
+// is *not* executed yet; that happens once the scheduler picks it.
+//
+// BlockClosure>>forkAt: aPriority  →  same with caller-supplied priority.
+fn primBlockFork(vm: *Vm, receiver: Oop, args: []const Oop, mode: ?ForkPriorityMode) PrimError!Oop {
+    var recv_pin: Oop = receiver;
+    var arg_pin: Oop = if (args.len > 0) args[0] else oop_mod.NIL;
+    var slots: [2]?*Oop = .{ &recv_pin, &arg_pin };
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slots, .n = 2 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+
+    if (!oop_mod.isHeapPtr(recv_pin)) return error.TypeError;
+    if (object.headerOf(recv_pin).class != vm.globals.block_closure_class) return error.TypeError;
+
+    var priority: i64 = object.PRIORITY_USER_SCHEDULING;
+    if (mode) |_| {
+        if (args.len != 1) return error.ArityMismatch;
+        if (!oop_mod.isInt(arg_pin)) return error.TypeError;
+        priority = oop_mod.toInt(arg_pin);
+        if (priority < 1 or priority > object.MAX_PRIORITY) return error.PrimitiveFailed;
+    } else {
+        if (args.len != 0) return error.ArityMismatch;
+    }
+
+    const p = try newProcess(vm, recv_pin, priority);
+    schedulerEnqueue(vm, p);
+    return p;
+}
+
+// Semaphore>>wait — decrement count when positive. With no scheduler we
+// can't suspend the active process, so a zero-count wait surfaces as
+// PrimitiveFailed; the AST fallback in stdlib turns that into a
+// signaled Exception so user code stays well-defined.
+fn primSemaphoreWait(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const cnt_oop = object.slot(receiver, object.SLOT_SEMA_COUNT);
+    if (!oop_mod.isInt(cnt_oop)) return error.TypeError;
+    const cnt = oop_mod.toInt(cnt_oop);
+    if (cnt <= 0) return error.PrimitiveFailed;
+    object.setSlot(receiver, object.SLOT_SEMA_COUNT, oop_mod.fromInt(cnt - 1));
+    return receiver;
+}
+
+// Semaphore>>signal — increment count. If a Process is already on the
+// waiters list, mark it runnable and unlink; the actual transfer of
+// control happens when the scheduler runs.
+fn primSemaphoreSignal(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const cnt_oop = object.slot(receiver, object.SLOT_SEMA_COUNT);
+    if (!oop_mod.isInt(cnt_oop)) return error.TypeError;
+
+    const head = object.slot(receiver, object.SLOT_SEMA_WAITERS_HEAD);
+    if (oop_mod.isHeapPtr(head)) {
+        const next = object.slot(head, object.SLOT_PROCESS_NEXT_LINK);
+        object.setSlot(receiver, object.SLOT_SEMA_WAITERS_HEAD, next);
+        if (oop_mod.isNil(next)) {
+            object.setSlot(receiver, object.SLOT_SEMA_WAITERS_TAIL, oop_mod.NIL);
+        }
+        object.setSlot(head, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+        object.setSlot(head, object.SLOT_PROCESS_STATE, vm.globals.sym_runnable);
+        schedulerEnqueue(vm, head);
+        return receiver;
+    }
+    object.setSlot(receiver, object.SLOT_SEMA_COUNT, oop_mod.fromInt(oop_mod.toInt(cnt_oop) + 1));
+    return receiver;
+}
+
+fn primProcessResume(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    object.setSlot(receiver, object.SLOT_PROCESS_STATE, vm.globals.sym_runnable);
+    schedulerEnqueue(vm, receiver);
+    return receiver;
+}
+
+fn primProcessSuspend(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    object.setSlot(receiver, object.SLOT_PROCESS_STATE, vm.globals.sym_suspended);
+    return receiver;
+}
+
+fn primProcessTerminate(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    object.setSlot(receiver, object.SLOT_PROCESS_STATE, vm.globals.sym_terminated);
+    return receiver;
+}
+
+// Processor>>yield — when there's no preemption, the active process
+// keeps running. The contract still says "you may be rescheduled
+// here," and the scheduler hooking into this primitive will satisfy
+// that. For now the primitive returns NIL.
+fn primProcessorYield(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    return oop_mod.NIL;
+}
+
+// Processor>>activeProcess — returns the scheduler's recorded active
+// Process slot. NIL when no fork has happened yet.
+fn primProcessorActive(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    return object.slot(receiver, object.SLOT_SCHEDULER_ACTIVE);
 }

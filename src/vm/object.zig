@@ -178,6 +178,59 @@ pub const RET_INST_SIZE: u32 = 1;
 pub const SLOT_EXCEPTION_MESSAGE: u32 = 0;
 pub const EXCEPTION_INST_SIZE: u32 = 1;
 
+// Concurrency primitives. These layouts mirror classic Smalltalk
+// (Squeak/Pharo) so fork/wait/signal/resume primitives can read
+// and mutate ivars by index.
+//
+// Process { priority, state, block, name, nextLink, result, suspendedContext }
+//   priority         — SmallInt (1..7), default 3.
+//   state            — Symbol: #runnable, #suspended, #waiting, #terminated.
+//   block            — BlockClosure to run on first resume; cleared when
+//                      the process actually starts.
+//   name             — Symbol/String, optional, for debugging.
+//   nextLink         — link in a singly-linked process list (scheduler
+//                      runnable list, semaphore waiters, etc.).
+//   result           — final value the block returned, or NIL.
+//   suspendedContext — saved continuation when scheduler v2 lands;
+//                      NIL until then.
+pub const SLOT_PROCESS_PRIORITY: u32 = 0;
+pub const SLOT_PROCESS_STATE: u32 = 1;
+pub const SLOT_PROCESS_BLOCK: u32 = 2;
+pub const SLOT_PROCESS_NAME: u32 = 3;
+pub const SLOT_PROCESS_NEXT_LINK: u32 = 4;
+pub const SLOT_PROCESS_RESULT: u32 = 5;
+pub const SLOT_PROCESS_SUSPENDED_CONTEXT: u32 = 6;
+pub const PROCESS_INST_SIZE: u32 = 7;
+
+// Semaphore { count, waitersHead, waitersTail }
+//   count        — SmallInt; signal increments, wait decrements when > 0.
+//   waitersHead  — first waiting Process (FIFO), or NIL.
+//   waitersTail  — last waiting Process; same as head when single waiter.
+pub const SLOT_SEMA_COUNT: u32 = 0;
+pub const SLOT_SEMA_WAITERS_HEAD: u32 = 1;
+pub const SLOT_SEMA_WAITERS_TAIL: u32 = 2;
+pub const SEMA_INST_SIZE: u32 = 3;
+
+// ProcessorScheduler { quiescentLists, activeProcess }
+//   quiescentLists  — Array indexed by priority (1..MAX_PRIORITY); each
+//                     slot holds the head of that priority's runnable
+//                     Process list (NIL if empty).
+//   activeProcess   — the currently-executing Process, or NIL when no
+//                     processes have been forked yet.
+pub const SLOT_SCHEDULER_QLISTS: u32 = 0;
+pub const SLOT_SCHEDULER_ACTIVE: u32 = 1;
+pub const SCHEDULER_INST_SIZE: u32 = 2;
+
+// Smalltalk priority bands match the Pharo defaults; index 0 is unused
+// so user-facing priorities read 1..7.
+pub const PRIORITY_USER_BACKGROUND: i64 = 2;
+pub const PRIORITY_USER_SCHEDULING: i64 = 3;
+pub const PRIORITY_USER_INTERRUPT: i64 = 4;
+pub const PRIORITY_LOW_IO: i64 = 5;
+pub const PRIORITY_HIGH_IO: i64 = 6;
+pub const PRIORITY_TIMING: i64 = 7;
+pub const MAX_PRIORITY: u32 = 7;
+
 pub inline fn headerOf(addr: Oop) *Header {
     return @ptrFromInt(addr);
 }

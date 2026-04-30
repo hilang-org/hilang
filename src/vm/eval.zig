@@ -174,6 +174,8 @@ pub const Vm = struct {
             &g.literal_node_class,     &g.var_ref_node_class,       &g.assign_node_class,
             &g.send_node_class,        &g.super_send_node_class,    &g.block_node_class,
             &g.seq_node_class,         &g.ret_node_class,           &g.exception_class,
+            &g.process_class,          &g.semaphore_class,          &g.scheduler_class,
+            &g.processor,
             &g.smalltalk,              &g.symbol_table,
             &g.sym_nil,                &g.sym_true,                 &g.sym_false,
             &g.sym_smalltalk,          &g.sym_thisContext,          &g.sym_self,
@@ -181,6 +183,8 @@ pub const Vm = struct {
             &g.sym_plus,               &g.sym_minus,                &g.sym_times,
             &g.sym_lt,                 &g.sym_le,                   &g.sym_gt,
             &g.sym_ge,                 &g.sym_printString,
+            &g.sym_runnable,           &g.sym_suspended,
+            &g.sym_waiting,            &g.sym_terminated,
         };
         for (all_globals) |p| try self.pushRoot(&n, p);
         try self.pushRoot(&n, &self.current_frame);
