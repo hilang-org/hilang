@@ -14,8 +14,20 @@ pub const image = @import("image.zig");
 pub const gc = @import("gc.zig");
 pub const stdlib = @import("stdlib.zig");
 pub const jit = @import("jit.zig");
+pub const scheduler = @import("scheduler.zig");
 
 pub const Heap = heap.Heap;
 pub const Vm = eval.Vm;
 pub const Oop = oop.Oop;
 pub const Globals = globals.Globals;
+
+// `pub const x = @import(...)` registers the namespace but does
+// NOT pull a file's `test "..."` blocks into `zig build test` —
+// only `comptime { _ = @import(...) }` does. List every vm-side
+// file that contains tests so they're discovered.
+comptime {
+    _ = @import("bootstrap.zig");
+    _ = @import("eval.zig");
+    _ = @import("jit.zig");
+    _ = @import("scheduler.zig");
+}

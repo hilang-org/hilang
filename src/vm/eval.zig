@@ -1822,7 +1822,7 @@ test "printNl writes to output sink" {
     var env: TestEnv = undefined;
     try env.init();
     defer env.deinit();
-    var buf = std.ArrayList(u8){};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     env.vm.output = .{ .buffer = &buf, .allocator = std.testing.allocator };
 
@@ -2015,7 +2015,7 @@ test "AST method: SmallInteger>>double" {
     const params = try env.vm.heap.allocSlots(env.vm.globals.array_class, 0);
     const temps = try env.vm.heap.allocSlots(env.vm.globals.array_class, 0);
     const m = try method_mod.newAst(env.vm.heap, &env.vm.globals, env.vm.globals.smallinteger_class, "double", 0, params, temps, body_arr);
-    try method_mod.install(env.vm.heap, &env.vm.globals, env.vm, env.vm.globals.smallinteger_class, "double", m);
+    try method_mod.install(env.vm.heap, &env.vm.globals, &env.vm, env.vm.globals.smallinteger_class, "double", m);
 
     const result = try env.evalJson(
         \\{"send":{"receiver":{"literal":{"int":21}},"selector":"double","args":[]}}
