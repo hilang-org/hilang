@@ -2936,4 +2936,64 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
             try litString(c, "POST"), try varRef(c, "aUrl"), try varRef(c, "aBody"),
         })),
     });
+
+    // ---- DateTime ----
+    //
+    // UTC wall-clock value with six SmallInt ivars in declaration
+    // order — slot indices match what `primNow` writes. Class side
+    // `now` is the entry point; instance side gives accessors and a
+    // canonical ISO-8601 string formatter ('YYYY-MM-DDTHH:MM:SSZ').
+    const dt_class = try defineClassAndRegister(
+        heap,
+        g,
+        "DateTime",
+        g.object_class,
+        &.{ "year", "month", "day", "hour", "minute", "second" },
+    );
+
+    try defineMethod(c, dt_class, "year", &.{}, &.{}, &.{try ret(c, try varRef(c, "year"))});
+    try defineMethod(c, dt_class, "month", &.{}, &.{}, &.{try ret(c, try varRef(c, "month"))});
+    try defineMethod(c, dt_class, "day", &.{}, &.{}, &.{try ret(c, try varRef(c, "day"))});
+    try defineMethod(c, dt_class, "hour", &.{}, &.{}, &.{try ret(c, try varRef(c, "hour"))});
+    try defineMethod(c, dt_class, "minute", &.{}, &.{}, &.{try ret(c, try varRef(c, "minute"))});
+    try defineMethod(c, dt_class, "second", &.{}, &.{}, &.{try ret(c, try varRef(c, "second"))});
+
+    // Helper: pad an integer to two digits with a leading zero.
+    //   pad2: n  ^n < 10 ifTrue: ['0', n asString] ifFalse: [n asString]
+    try defineMethod(c, dt_class, "pad2:", &.{"n"}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "n"), "<", &.{try litInt(c, 10)}), "ifTrue:ifFalse:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try litString(c, "0"), ",", &.{try send(c, try varRef(c, "n"), "asString", &.{})}),
+            }),
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "n"), "asString", &.{}),
+            }),
+        })),
+    });
+
+    // asString  ^year asString, '-', (self pad2: month), '-', (self pad2: day),
+    //          'T', (self pad2: hour), ':', (self pad2: minute), ':', (self pad2: second), 'Z'
+    try defineMethod(c, dt_class, "asString", &.{}, &.{"r"}, &.{
+        try assignNode(c, "r", try send(c, try varRef(c, "year"), "asString", &.{})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try litString(c, "-")})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try send(c, try varRef(c, "self"), "pad2:", &.{try varRef(c, "month")})})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try litString(c, "-")})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try send(c, try varRef(c, "self"), "pad2:", &.{try varRef(c, "day")})})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try litString(c, "T")})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try send(c, try varRef(c, "self"), "pad2:", &.{try varRef(c, "hour")})})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try litString(c, ":")})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try send(c, try varRef(c, "self"), "pad2:", &.{try varRef(c, "minute")})})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try litString(c, ":")})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try send(c, try varRef(c, "self"), "pad2:", &.{try varRef(c, "second")})})),
+        try assignNode(c, "r", try send(c, try varRef(c, "r"), ",", &.{try litString(c, "Z")})),
+        try ret(c, try varRef(c, "r")),
+    });
+
+    // Class side now wraps the primitive (installed in bootstrap.zig
+    // as DateTime class>>primNow). Aliased to `now` for the natural
+    // call site.
+    const dt_meta = object.headerOf(dt_class).class;
+    try defineMethod(c, dt_meta, "now", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "primNow", &.{})),
+    });
 }

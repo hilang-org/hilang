@@ -138,6 +138,7 @@ pub const PRIM_STRING_REPLACE_ALL: u32 = 354;
 pub const PRIM_STRING_TRIMMED: u32 = 355;
 pub const PRIM_STRING_ENDS_WITH: u32 = 356;
 pub const PRIM_STRING_AS_INTEGER: u32 = 357;
+pub const PRIM_DATETIME_NOW: u32 = 360;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -255,6 +256,7 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_STRING_TRIMMED => primStringTrimmed(vm, receiver, args),
         PRIM_STRING_ENDS_WITH => primStringEndsWith(vm, receiver, args),
         PRIM_STRING_AS_INTEGER => primStringAsInteger(vm, receiver, args),
+        PRIM_DATETIME_NOW => primDateTimeNow(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1019,6 +1021,52 @@ fn primStringStartsWith(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop 
     const r_bytes = object.bytesOf(receiver)[0..r_hdr.size];
     const p_bytes = object.bytesOf(args[0])[0..p_hdr.size];
     return oop_mod.fromBool(std.mem.startsWith(u8, r_bytes, p_bytes));
+}
+
+// DateTime class>>primNow — allocate a fresh DateTime instance
+// (slot layout: year, month, day, hour, minute, second) filled
+// with the current UTC wall-clock values.
+//
+// Civil-from-days conversion follows Howard Hinnant's algorithm
+// (http://howardhinnant.github.io/date_algorithms.html#civil_from_days);
+// it works for any year fitting in i32, no leap-table lookups.
+fn primDateTimeNow(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) {
+        return error.PrimitiveFailed;
+    }
+    const epoch: i64 = @intCast(ts.sec);
+
+    const seconds_per_day: i64 = 86400;
+    const days: i64 = @divFloor(epoch, seconds_per_day);
+    const sod: i64 = epoch - days * seconds_per_day;
+    const hour: i64 = @divTrunc(sod, 3600);
+    const minute: i64 = @divTrunc(sod - hour * 3600, 60);
+    const second: i64 = sod - hour * 3600 - minute * 60;
+
+    // Civil from days. `days` is days since 1970-01-01.
+    const z: i64 = days + 719468;
+    const era: i64 = if (z >= 0) @divTrunc(z, 146097) else @divTrunc(z - 146096, 146097);
+    const doe: i64 = z - era * 146097; // [0, 146096]
+    const yoe: i64 = @divTrunc(doe - @divTrunc(doe, 1460) + @divTrunc(doe, 36524) - @divTrunc(doe, 146096), 365);
+    const y_civil: i64 = yoe + era * 400;
+    const doy: i64 = doe - (365 * yoe + @divTrunc(yoe, 4) - @divTrunc(yoe, 100));
+    const mp: i64 = @divTrunc(5 * doy + 2, 153);
+    const d_civil: i64 = doy - @divTrunc(153 * mp + 2, 5) + 1;
+    const m_civil: i64 = if (mp < 10) mp + 3 else mp - 9;
+    const year: i64 = if (m_civil <= 2) y_civil + 1 else y_civil;
+
+    const inst = vm.heap.allocSlots(receiver, 6) catch return error.OutOfMemory;
+    object.setSlot(inst, 0, oop_mod.fromInt(year));
+    object.setSlot(inst, 1, oop_mod.fromInt(m_civil));
+    object.setSlot(inst, 2, oop_mod.fromInt(d_civil));
+    object.setSlot(inst, 3, oop_mod.fromInt(hour));
+    object.setSlot(inst, 4, oop_mod.fromInt(minute));
+    object.setSlot(inst, 5, oop_mod.fromInt(second));
+    return inst;
 }
 
 // String>>asInteger — parse a leading decimal integer (with

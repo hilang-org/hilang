@@ -367,6 +367,15 @@ pub fn bootstrap(heap: *Heap) !Globals {
         try installPrim(heap, &g, delay_cls, "wait", 0, prims.PRIM_DELAY_WAIT);
     }
 
+    // DateTime class>>primNow — installed on the metaclass so the
+    // method is `DateTime primNow`, called by the class-side `now`
+    // wrapper from stdlib's loadConcurrency.
+    const dt_cls = dict_mod.lookup(g.smalltalk, "DateTime");
+    if (oop_mod.isHeapPtr(dt_cls)) {
+        const dt_meta = object.headerOf(dt_cls).class;
+        try installPrim(heap, &g, dt_meta, "primNow", 0, prims.PRIM_DATETIME_NOW);
+    }
+
     // FileStream primitives. Receiver is a FileStream; slot 0 (`fd`)
     // is the underlying POSIX file descriptor.
     if (oop_mod.isHeapPtr(g.file_stream_class)) {
