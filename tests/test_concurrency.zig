@@ -604,6 +604,41 @@ test "Delay wait blocks at least N nanoseconds" {
     try std.testing.expect(elapsed < 1_000_000_000);
 }
 
+test "Terminated processes are reaped from the Vm's process list" {
+    // Without the reaper, every fork leaves a dangling Process oop
+    // on Vm.all_processes (and a 2 MiB mmap'd stack on
+    // Vm.process_stacks) for the lifetime of the Vm.
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    // Lazy-create the main process so we have a stable baseline of 1.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+    const before = env.machine.all_processes.items.len;
+    const stacks_before = env.machine.process_stacks.items.len;
+
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        _ = try env.evalJson(
+            \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[{"literal":{"int":1}}]}},
+            \\"selector":"fork","args":[]}}
+        );
+    }
+    // Drain — each yield ends a worker; reapTerminated runs at
+    // dequeueHighestRunnable, which fires every yield.
+    var j: u32 = 0;
+    while (j < 8) : (j += 1) {
+        _ = try env.evalJson(
+            \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+        );
+    }
+
+    try std.testing.expectEqual(before, env.machine.all_processes.items.len);
+    try std.testing.expectEqual(stacks_before, env.machine.process_stacks.items.len);
+}
+
 test "Delay does not block the whole VM" {
     // A worker waits on a Delay. Main waits on a semaphore that
     // the worker signals after the delay returns. The fact that

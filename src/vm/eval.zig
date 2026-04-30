@@ -437,9 +437,11 @@ pub const Vm = struct {
 
     /// Pop the head of the highest-priority non-empty runnable list.
     /// NIL when nobody is runnable. Drains expired sleepers off the
-    /// delay queue first so they get a chance to run.
+    /// delay queue first so they get a chance to run, then reaps
+    /// any terminated processes' mmap stacks.
     fn dequeueHighestRunnable(self: *Vm) Oop {
         self.expireSleepers(monotonicNanos());
+        self.reapTerminated();
         const sched = self.globals.processor;
         if (!oop_mod.isHeapPtr(sched)) return oop_mod.NIL;
         const lists = object.slot(sched, object.SLOT_SCHEDULER_QLISTS);
@@ -516,6 +518,48 @@ pub const Vm = struct {
             head = next;
         }
         object.setSlot(sched, object.SLOT_SCHEDULER_DELAY_HEAD, head);
+    }
+
+    /// Sweep `all_processes` for terminated entries: munmap their
+    /// per-process stacks and drop them from the list (so the next
+    /// GC can collect the Process oop). Skips the active process —
+    /// `processEntry` calls `scheduleNext` *while still on its own
+    /// stack*, so we mustn't free it from under itself.
+    ///
+    /// Trade-off: removing terminated entries means `aProcess result`
+    /// after termination is racy (the Process oop may have been
+    /// collected before the read). hilang's userland doesn't poll
+    /// fork results today; revisit if a join: protocol lands.
+    fn reapTerminated(self: *Vm) void {
+        var i: usize = 0;
+        while (i < self.all_processes.items.len) {
+            const proc = self.all_processes.items[i];
+            if (proc == self.current_process or !oop_mod.isHeapPtr(proc)) {
+                i += 1;
+                continue;
+            }
+            const state_oop = object.slot(proc, object.SLOT_PROCESS_STATE);
+            if (state_oop != self.globals.sym_terminated) {
+                i += 1;
+                continue;
+            }
+            const ps = processStateOf(proc);
+            if (ps.stack_base != 0) {
+                var j: usize = 0;
+                while (j < self.process_stacks.items.len) : (j += 1) {
+                    if (@intFromPtr(self.process_stacks.items[j].base.ptr) == ps.stack_base) {
+                        self.process_stacks.items[j].free();
+                        _ = self.process_stacks.swapRemove(j);
+                        break;
+                    }
+                }
+                ps.stack_base = 0;
+                ps.stack_size = 0;
+                ps.bc_pin = 0;
+            }
+            _ = self.all_processes.swapRemove(i);
+            // Don't bump i — swapRemove brought a new entry to this slot.
+        }
     }
 
     /// Append a Process at the tail of its priority's runnable list.
