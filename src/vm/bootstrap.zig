@@ -289,6 +289,7 @@ pub fn bootstrap(heap: *Heap) !Globals {
     try installPrim(heap, &g, g.string_class, "replaceAll:with:", 2, prims.PRIM_STRING_REPLACE_ALL);
     try installPrim(heap, &g, g.string_class, "trimmed", 0, prims.PRIM_STRING_TRIMMED);
     try installPrim(heap, &g, g.string_class, "endsWith:", 1, prims.PRIM_STRING_ENDS_WITH);
+    try installPrim(heap, &g, g.string_class, "asInteger", 0, prims.PRIM_STRING_AS_INTEGER);
     try installPrim(heap, &g, g.class_class, "selectors", 0, prims.PRIM_BEHAVIOR_SELECTORS);
     try installPrim(heap, &g, g.string_class, "startsWith:", 1, prims.PRIM_STRING_STARTS_WITH);
     try installPrim(heap, &g, g.exception_class, "signal:", 1, prims.PRIM_EXC_SIGNAL);

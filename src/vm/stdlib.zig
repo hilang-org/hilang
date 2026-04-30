@@ -54,6 +54,11 @@ fn litString(c: Ctx, s: []const u8) !Oop {
     return lit(c, str);
 }
 
+fn litSymbol(c: Ctx, s: []const u8) !Oop {
+    const sym = try dict.newSymbol(c.heap, c.g, s);
+    return lit(c, sym);
+}
+
 fn varRef(c: Ctx, name: []const u8) !Oop {
     const sym = try dict.newSymbol(c.heap, c.g, name);
     const node = try c.heap.allocSlots(c.g.var_ref_node_class, object.VARREF_INST_SIZE);
@@ -2721,6 +2726,214 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
     try defineMethod(c, sock_meta, "listenOn:", &.{"aPort"}, &.{}, &.{
         try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "primListen:", &.{
             try varRef(c, "aPort"),
+        })),
+    });
+
+    // ---- HttpClient ----
+    //
+    // Pure-Smalltalk client over Socket. Supports HTTP/1.0 GET
+    // and POST with Connection: close (so readAll terminates
+    // cleanly when the server hangs up). HTTPS is out of scope
+    // until a TLS layer lands. Returns a Dictionary keyed by
+    // 'statusCode' (Integer), 'headers' (Dictionary of
+    // lowercased name → value), and 'body' (String).
+    const http_client = try defineClassAndRegister(heap, g, "HttpClient", g.object_class, &.{});
+    const http_meta = object.headerOf(http_client).class;
+
+    // HttpClient class>>parseUrl: aUrl
+    //   | rest slashIdx hostPort path colonIdx host port d |
+    //   rest := (aUrl findString: '://') > 0
+    //     ifTrue: [aUrl copyFrom: ((aUrl findString: '://') + 3) to: aUrl size]
+    //     ifFalse: [aUrl].
+    //   slashIdx := rest findString: '/'.
+    //   slashIdx > 0
+    //     ifTrue: [hostPort := rest copyFrom: 1 to: slashIdx - 1.
+    //              path := rest copyFrom: slashIdx to: rest size]
+    //     ifFalse: [hostPort := rest. path := '/'].
+    //   colonIdx := hostPort findString: ':'.
+    //   colonIdx > 0
+    //     ifTrue: [host := hostPort copyFrom: 1 to: colonIdx - 1.
+    //              port := (hostPort copyFrom: colonIdx + 1 to: hostPort size) asInteger]
+    //     ifFalse: [host := hostPort. port := 80].
+    //   d := Dictionary new init.
+    //   d at: 'host' put: host. d at: 'port' put: port. d at: 'path' put: path.
+    //   ^d
+    try defineMethod(c, http_meta, "parseUrl:", &.{"aUrl"}, &.{ "rest", "slashIdx", "hostPort", "path", "colonIdx", "host", "port", "d" }, &.{
+        try assignNode(c, "rest", try send(c, try send(c, try send(c, try varRef(c, "aUrl"), "findString:", &.{try litString(c, "://")}), ">", &.{try litInt(c, 0)}), "ifTrue:ifFalse:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try varRef(c, "aUrl"), "copyFrom:to:", &.{
+                    try send(c, try send(c, try varRef(c, "aUrl"), "findString:", &.{try litString(c, "://")}), "+", &.{try litInt(c, 3)}),
+                    try send(c, try varRef(c, "aUrl"), "size", &.{}),
+                }),
+            }),
+            try block(c, &.{}, &.{}, &.{try varRef(c, "aUrl")}),
+        })),
+        try assignNode(c, "slashIdx", try send(c, try varRef(c, "rest"), "findString:", &.{try litString(c, "/")})),
+        try send(c, try send(c, try varRef(c, "slashIdx"), ">", &.{try litInt(c, 0)}), "ifTrue:ifFalse:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "hostPort", try send(c, try varRef(c, "rest"), "copyFrom:to:", &.{
+                    try litInt(c, 1),
+                    try send(c, try varRef(c, "slashIdx"), "-", &.{try litInt(c, 1)}),
+                })),
+                try assignNode(c, "path", try send(c, try varRef(c, "rest"), "copyFrom:to:", &.{
+                    try varRef(c, "slashIdx"),
+                    try send(c, try varRef(c, "rest"), "size", &.{}),
+                })),
+            }),
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "hostPort", try varRef(c, "rest")),
+                try assignNode(c, "path", try litString(c, "/")),
+            }),
+        }),
+        try assignNode(c, "colonIdx", try send(c, try varRef(c, "hostPort"), "findString:", &.{try litString(c, ":")})),
+        try send(c, try send(c, try varRef(c, "colonIdx"), ">", &.{try litInt(c, 0)}), "ifTrue:ifFalse:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "host", try send(c, try varRef(c, "hostPort"), "copyFrom:to:", &.{
+                    try litInt(c, 1),
+                    try send(c, try varRef(c, "colonIdx"), "-", &.{try litInt(c, 1)}),
+                })),
+                try assignNode(c, "port", try send(c, try send(c, try varRef(c, "hostPort"), "copyFrom:to:", &.{
+                    try send(c, try varRef(c, "colonIdx"), "+", &.{try litInt(c, 1)}),
+                    try send(c, try varRef(c, "hostPort"), "size", &.{}),
+                }), "asInteger", &.{})),
+            }),
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "host", try varRef(c, "hostPort")),
+                try assignNode(c, "port", try litInt(c, 80)),
+            }),
+        }),
+        try assignNode(c, "d", try send(c, try send(c, try varRef(c, "Dictionary"), "new", &.{}), "init", &.{})),
+        try send(c, try varRef(c, "d"), "at:put:", &.{try litSymbol(c, "host"), try varRef(c, "host")}),
+        try send(c, try varRef(c, "d"), "at:put:", &.{try litSymbol(c, "port"), try varRef(c, "port")}),
+        try send(c, try varRef(c, "d"), "at:put:", &.{try litSymbol(c, "path"), try varRef(c, "path")}),
+        try ret(c, try varRef(c, "d")),
+    });
+
+    // HttpClient class>>parseResponse: aString
+    //   | sepIdx headerStr bodyStr lines parts code headers result i line colonIdx k v |
+    //   sepIdx := aString findString: <CRLFCRLF>.
+    //   sepIdx > 0 ifTrue: [
+    //     headerStr := aString copyFrom: 1 to: sepIdx - 1.
+    //     bodyStr := aString copyFrom: sepIdx + 4 to: aString size]
+    //   ifFalse: [headerStr := aString. bodyStr := ''].
+    //   lines := headerStr subStrings: <LF>.
+    //   parts := (lines at: 1) trimmed subStrings: ' '.
+    //   code := (parts at: 2) asInteger.
+    //   headers := Dictionary new init.
+    //   i := 2.
+    //   [i <= lines size] whileTrue: [
+    //     line := (lines at: i) trimmed.
+    //     colonIdx := line findString: ':'.
+    //     colonIdx > 0 ifTrue: [
+    //       k := (line copyFrom: 1 to: colonIdx - 1) trimmed asLowercase.
+    //       v := (line copyFrom: colonIdx + 1 to: line size) trimmed.
+    //       headers at: k put: v].
+    //     i := i + 1].
+    //   result := Dictionary new init.
+    //   result at: 'statusCode' put: code.
+    //   result at: 'headers' put: headers.
+    //   result at: 'body' put: bodyStr.
+    //   ^result
+    try defineMethod(c, http_meta, "parseResponse:", &.{"aString"}, &.{ "sepIdx", "headerStr", "bodyStr", "lines", "parts", "code", "headers", "result", "i", "line", "colonIdx", "k", "v" }, &.{
+        try assignNode(c, "sepIdx", try send(c, try varRef(c, "aString"), "findString:", &.{try litString(c, "\r\n\r\n")})),
+        try send(c, try send(c, try varRef(c, "sepIdx"), ">", &.{try litInt(c, 0)}), "ifTrue:ifFalse:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "headerStr", try send(c, try varRef(c, "aString"), "copyFrom:to:", &.{
+                    try litInt(c, 1),
+                    try send(c, try varRef(c, "sepIdx"), "-", &.{try litInt(c, 1)}),
+                })),
+                try assignNode(c, "bodyStr", try send(c, try varRef(c, "aString"), "copyFrom:to:", &.{
+                    try send(c, try varRef(c, "sepIdx"), "+", &.{try litInt(c, 4)}),
+                    try send(c, try varRef(c, "aString"), "size", &.{}),
+                })),
+            }),
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "headerStr", try varRef(c, "aString")),
+                try assignNode(c, "bodyStr", try litString(c, "")),
+            }),
+        }),
+        try assignNode(c, "lines", try send(c, try varRef(c, "headerStr"), "subStrings:", &.{try litString(c, "\n")})),
+        try assignNode(c, "parts", try send(c, try send(c, try send(c, try varRef(c, "lines"), "at:", &.{try litInt(c, 1)}), "trimmed", &.{}), "subStrings:", &.{try litString(c, " ")})),
+        try assignNode(c, "code", try send(c, try send(c, try varRef(c, "parts"), "at:", &.{try litInt(c, 2)}), "asInteger", &.{})),
+        try assignNode(c, "headers", try send(c, try send(c, try varRef(c, "Dictionary"), "new", &.{}), "init", &.{})),
+        try assignNode(c, "i", try litInt(c, 2)),
+        try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "i"), "<=", &.{try send(c, try varRef(c, "lines"), "size", &.{})}),
+        }), "whileTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "line", try send(c, try send(c, try varRef(c, "lines"), "at:", &.{try varRef(c, "i")}), "trimmed", &.{})),
+                try assignNode(c, "colonIdx", try send(c, try varRef(c, "line"), "findString:", &.{try litString(c, ":")})),
+                try send(c, try send(c, try varRef(c, "colonIdx"), ">", &.{try litInt(c, 0)}), "ifTrue:", &.{
+                    try block(c, &.{}, &.{}, &.{
+                        try assignNode(c, "k", try send(c, try send(c, try send(c, try send(c, try varRef(c, "line"), "copyFrom:to:", &.{
+                            try litInt(c, 1),
+                            try send(c, try varRef(c, "colonIdx"), "-", &.{try litInt(c, 1)}),
+                        }), "trimmed", &.{}), "asLowercase", &.{}), "asSymbol", &.{})),
+                        try assignNode(c, "v", try send(c, try send(c, try varRef(c, "line"), "copyFrom:to:", &.{
+                            try send(c, try varRef(c, "colonIdx"), "+", &.{try litInt(c, 1)}),
+                            try send(c, try varRef(c, "line"), "size", &.{}),
+                        }), "trimmed", &.{})),
+                        try send(c, try varRef(c, "headers"), "at:put:", &.{try varRef(c, "k"), try varRef(c, "v")}),
+                    }),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "+", &.{try litInt(c, 1)})),
+            }),
+        }),
+        try assignNode(c, "result", try send(c, try send(c, try varRef(c, "Dictionary"), "new", &.{}), "init", &.{})),
+        try send(c, try varRef(c, "result"), "at:put:", &.{try litSymbol(c, "statusCode"), try varRef(c, "code")}),
+        try send(c, try varRef(c, "result"), "at:put:", &.{try litSymbol(c, "headers"), try varRef(c, "headers")}),
+        try send(c, try varRef(c, "result"), "at:put:", &.{try litSymbol(c, "body"), try varRef(c, "bodyStr")}),
+        try ret(c, try varRef(c, "result")),
+    });
+
+    // HttpClient class>>request: method url: aUrl body: aBody
+    //   | parts host port path sock req resp |
+    //   parts := self parseUrl: aUrl.
+    //   host := parts at: 'host'. port := parts at: 'port'. path := parts at: 'path'.
+    //   sock := Socket connectTo: host port: port.
+    //   req := method, ' ', path, ' HTTP/1.0', <CRLF>,
+    //          'Host: ', host, <CRLF>,
+    //          'Content-Length: ', aBody size asString, <CRLF>,
+    //          'Connection: close', <CRLF>, <CRLF>, aBody.
+    //   sock nextPutAll: req.
+    //   resp := sock readAll.
+    //   sock close.
+    //   ^self parseResponse: resp
+    try defineMethod(c, http_meta, "request:url:body:", &.{ "method", "aUrl", "aBody" }, &.{ "parts", "host", "port", "path", "sock", "req", "resp" }, &.{
+        try assignNode(c, "parts", try send(c, try varRef(c, "self"), "parseUrl:", &.{try varRef(c, "aUrl")})),
+        try assignNode(c, "host", try send(c, try varRef(c, "parts"), "at:", &.{try litSymbol(c, "host")})),
+        try assignNode(c, "port", try send(c, try varRef(c, "parts"), "at:", &.{try litSymbol(c, "port")})),
+        try assignNode(c, "path", try send(c, try varRef(c, "parts"), "at:", &.{try litSymbol(c, "path")})),
+        try assignNode(c, "sock", try send(c, try varRef(c, "Socket"), "connectTo:port:", &.{
+            try varRef(c, "host"), try varRef(c, "port"),
+        })),
+        // Build the request string via repeated `,` concat. Verbose but
+        // avoids needing a WriteStream backed by String here.
+        try assignNode(c, "req", try send(c, try varRef(c, "method"), ",", &.{try litString(c, " ")})),
+        try assignNode(c, "req", try send(c, try varRef(c, "req"), ",", &.{try varRef(c, "path")})),
+        try assignNode(c, "req", try send(c, try varRef(c, "req"), ",", &.{try litString(c, " HTTP/1.0\r\nHost: ")})),
+        try assignNode(c, "req", try send(c, try varRef(c, "req"), ",", &.{try varRef(c, "host")})),
+        try assignNode(c, "req", try send(c, try varRef(c, "req"), ",", &.{try litString(c, "\r\nContent-Length: ")})),
+        try assignNode(c, "req", try send(c, try varRef(c, "req"), ",", &.{try send(c, try send(c, try varRef(c, "aBody"), "size", &.{}), "asString", &.{})})),
+        try assignNode(c, "req", try send(c, try varRef(c, "req"), ",", &.{try litString(c, "\r\nConnection: close\r\n\r\n")})),
+        try assignNode(c, "req", try send(c, try varRef(c, "req"), ",", &.{try varRef(c, "aBody")})),
+        try send(c, try varRef(c, "sock"), "nextPutAll:", &.{try varRef(c, "req")}),
+        try assignNode(c, "resp", try send(c, try varRef(c, "sock"), "readAll", &.{})),
+        try send(c, try varRef(c, "sock"), "close", &.{}),
+        try ret(c, try send(c, try varRef(c, "self"), "parseResponse:", &.{try varRef(c, "resp")})),
+    });
+
+    // HttpClient class>>get: aUrl  ^self request: 'GET' url: aUrl body: ''
+    try defineMethod(c, http_meta, "get:", &.{"aUrl"}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "request:url:body:", &.{
+            try litString(c, "GET"), try varRef(c, "aUrl"), try litString(c, ""),
+        })),
+    });
+
+    // HttpClient class>>post: aUrl body: aBody  ^self request: 'POST' url: aUrl body: aBody
+    try defineMethod(c, http_meta, "post:body:", &.{ "aUrl", "aBody" }, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "request:url:body:", &.{
+            try litString(c, "POST"), try varRef(c, "aUrl"), try varRef(c, "aBody"),
         })),
     });
 }

@@ -137,6 +137,7 @@ pub const PRIM_STRING_AS_LOWERCASE: u32 = 353;
 pub const PRIM_STRING_REPLACE_ALL: u32 = 354;
 pub const PRIM_STRING_TRIMMED: u32 = 355;
 pub const PRIM_STRING_ENDS_WITH: u32 = 356;
+pub const PRIM_STRING_AS_INTEGER: u32 = 357;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -253,6 +254,7 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_STRING_REPLACE_ALL => primStringReplaceAll(vm, receiver, args),
         PRIM_STRING_TRIMMED => primStringTrimmed(vm, receiver, args),
         PRIM_STRING_ENDS_WITH => primStringEndsWith(vm, receiver, args),
+        PRIM_STRING_AS_INTEGER => primStringAsInteger(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1017,6 +1019,40 @@ fn primStringStartsWith(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop 
     const r_bytes = object.bytesOf(receiver)[0..r_hdr.size];
     const p_bytes = object.bytesOf(args[0])[0..p_hdr.size];
     return oop_mod.fromBool(std.mem.startsWith(u8, r_bytes, p_bytes));
+}
+
+// String>>asInteger — parse a leading decimal integer (with
+// optional '-' sign and surrounding whitespace). Returns 0 if
+// the receiver doesn't start with a digit; this matches
+// Pharo's permissive parsing rather than failing hard.
+fn primStringAsInteger(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const hdr = object.headerOf(receiver);
+    if ((hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const bytes = object.bytesOf(receiver)[0..hdr.size];
+    const trimmed = std.mem.trim(u8, bytes, " \t\n\r");
+    if (trimmed.len == 0) return oop_mod.fromInt(0);
+    var i: usize = 0;
+    var neg: bool = false;
+    if (trimmed[0] == '-') {
+        neg = true;
+        i = 1;
+    } else if (trimmed[0] == '+') {
+        i = 1;
+    }
+    var n: i64 = 0;
+    var saw: bool = false;
+    while (i < trimmed.len) : (i += 1) {
+        const ch = trimmed[i];
+        if (ch < '0' or ch > '9') break;
+        const digit: i64 = @intCast(ch - '0');
+        n = n *% 10 +% digit;
+        if (!oop_mod.fitsSmallInt(n)) return error.PrimitiveFailed;
+        saw = true;
+    }
+    if (!saw) return oop_mod.fromInt(0);
+    return oop_mod.fromInt(if (neg) -n else n);
 }
 
 // String>>endsWith: aString — mirror of startsWith:.
