@@ -130,6 +130,13 @@ pub const PRIM_SOCK_LISTEN: u32 = 331;
 pub const PRIM_SOCK_ACCEPT: u32 = 332;
 pub const PRIM_STR_AS_JSON_VALUE: u32 = 340;
 pub const PRIM_OBJ_AS_JSON: u32 = 341;
+pub const PRIM_STRING_INDEX_OF: u32 = 350;
+pub const PRIM_STRING_SUBSTRINGS: u32 = 351;
+pub const PRIM_STRING_AS_UPPERCASE: u32 = 352;
+pub const PRIM_STRING_AS_LOWERCASE: u32 = 353;
+pub const PRIM_STRING_REPLACE_ALL: u32 = 354;
+pub const PRIM_STRING_TRIMMED: u32 = 355;
+pub const PRIM_STRING_ENDS_WITH: u32 = 356;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -239,6 +246,13 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_SOCK_ACCEPT => primSockAccept(vm, receiver, args),
         PRIM_STR_AS_JSON_VALUE => primStrAsJsonValue(vm, receiver, args),
         PRIM_OBJ_AS_JSON => primObjAsJson(vm, receiver, args),
+        PRIM_STRING_INDEX_OF => primStringIndexOf(vm, receiver, args),
+        PRIM_STRING_SUBSTRINGS => primStringSubstrings(vm, receiver, args),
+        PRIM_STRING_AS_UPPERCASE => primStringAsUppercase(vm, receiver, args),
+        PRIM_STRING_AS_LOWERCASE => primStringAsLowercase(vm, receiver, args),
+        PRIM_STRING_REPLACE_ALL => primStringReplaceAll(vm, receiver, args),
+        PRIM_STRING_TRIMMED => primStringTrimmed(vm, receiver, args),
+        PRIM_STRING_ENDS_WITH => primStringEndsWith(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1003,6 +1017,140 @@ fn primStringStartsWith(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop 
     const r_bytes = object.bytesOf(receiver)[0..r_hdr.size];
     const p_bytes = object.bytesOf(args[0])[0..p_hdr.size];
     return oop_mod.fromBool(std.mem.startsWith(u8, r_bytes, p_bytes));
+}
+
+// String>>endsWith: aString — mirror of startsWith:.
+fn primStringEndsWith(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver) or !oop_mod.isHeapPtr(args[0])) return error.TypeError;
+    const r_hdr = object.headerOf(receiver);
+    const p_hdr = object.headerOf(args[0]);
+    if ((r_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    if ((p_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    if (p_hdr.size > r_hdr.size) return oop_mod.FALSE;
+    const r_bytes = object.bytesOf(receiver)[0..r_hdr.size];
+    const p_bytes = object.bytesOf(args[0])[0..p_hdr.size];
+    return oop_mod.fromBool(std.mem.endsWith(u8, r_bytes, p_bytes));
+}
+
+// Helper: extract the receiver's raw byte slice. Returns
+// TypeError on a non-byte-object oop.
+fn stringBytes(o: Oop) PrimError![]const u8 {
+    if (!oop_mod.isHeapPtr(o)) return error.TypeError;
+    const hdr = object.headerOf(o);
+    if ((hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    return object.bytesOf(o)[0..hdr.size];
+}
+
+// String>>indexOf: aString — 1-based index of the first
+// occurrence of aString in receiver, or 0 if not found.
+// Empty needle matches at position 1 (Pharo convention).
+fn primStringIndexOf(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    const haystack = try stringBytes(receiver);
+    const needle = try stringBytes(args[0]);
+    if (needle.len == 0) return oop_mod.fromInt(1);
+    const idx = std.mem.indexOf(u8, haystack, needle) orelse return oop_mod.fromInt(0);
+    return oop_mod.fromInt(@intCast(idx + 1));
+}
+
+// String>>asUppercase / asLowercase — ASCII-only case mapping.
+// A new String is allocated; receiver is unchanged.
+fn primStringAsUppercase(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    const src = try stringBytes(receiver);
+    const out = vm.heap.allocBytes(vm.globals.string_class, @intCast(src.len)) catch return error.OutOfMemory;
+    const dst = object.bytesOf(out)[0..src.len];
+    for (src, 0..) |b, i| dst[i] = std.ascii.toUpper(b);
+    return out;
+}
+
+fn primStringAsLowercase(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    const src = try stringBytes(receiver);
+    const out = vm.heap.allocBytes(vm.globals.string_class, @intCast(src.len)) catch return error.OutOfMemory;
+    const dst = object.bytesOf(out)[0..src.len];
+    for (src, 0..) |b, i| dst[i] = std.ascii.toLower(b);
+    return out;
+}
+
+// String>>trimmed — strip ASCII whitespace from both ends.
+fn primStringTrimmed(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    const src = try stringBytes(receiver);
+    const trimmed = std.mem.trim(u8, src, " \t\n\r");
+    const out = vm.heap.allocBytes(vm.globals.string_class, @intCast(trimmed.len)) catch return error.OutOfMemory;
+    if (trimmed.len > 0) @memcpy(object.bytesOf(out)[0..trimmed.len], trimmed);
+    return out;
+}
+
+// String>>replaceAll: old with: new — every non-overlapping
+// occurrence of old becomes new. Empty old returns receiver
+// unchanged (avoids an infinite loop).
+fn primStringReplaceAll(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 2) return error.ArityMismatch;
+    const src = try stringBytes(receiver);
+    const old = try stringBytes(args[0]);
+    const new = try stringBytes(args[1]);
+    if (old.len == 0) {
+        const out = vm.heap.allocBytes(vm.globals.string_class, @intCast(src.len)) catch return error.OutOfMemory;
+        if (src.len > 0) @memcpy(object.bytesOf(out)[0..src.len], src);
+        return out;
+    }
+
+    const alloc = std.heap.page_allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var i: usize = 0;
+    while (i + old.len <= src.len) {
+        if (std.mem.eql(u8, src[i .. i + old.len], old)) {
+            buf.appendSlice(alloc, new) catch return error.OutOfMemory;
+            i += old.len;
+        } else {
+            buf.append(alloc, src[i]) catch return error.OutOfMemory;
+            i += 1;
+        }
+    }
+    if (i < src.len) buf.appendSlice(alloc, src[i..]) catch return error.OutOfMemory;
+    const out = vm.heap.allocBytes(vm.globals.string_class, @intCast(buf.items.len)) catch return error.OutOfMemory;
+    if (buf.items.len > 0) @memcpy(object.bytesOf(out)[0..buf.items.len], buf.items);
+    return out;
+}
+
+// String>>subStrings: aDelim — split on aDelim (which may be
+// multiple characters; each character is treated as a delimiter).
+// Empty fragments are dropped — Pharo convention. Returns an
+// Array of Strings.
+fn primStringSubstrings(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    const src = try stringBytes(receiver);
+    const delim = try stringBytes(args[0]);
+
+    const alloc = std.heap.page_allocator;
+    var pieces: std.ArrayList([]const u8) = .empty;
+    defer pieces.deinit(alloc);
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        if (std.mem.indexOfScalar(u8, delim, src[i])) |_| {
+            if (i > start) pieces.append(alloc, src[start..i]) catch return error.OutOfMemory;
+            start = i + 1;
+        }
+    }
+    if (start < src.len) pieces.append(alloc, src[start..]) catch return error.OutOfMemory;
+
+    const arr = vm.heap.allocSlots(vm.globals.array_class, @intCast(pieces.items.len)) catch return error.OutOfMemory;
+    var pin_slot: Oop = arr;
+    var slot_ptrs: [1]?*Oop = .{&pin_slot};
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 1 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    for (pieces.items, 0..) |piece, idx| {
+        const s = vm.heap.allocBytes(vm.globals.string_class, @intCast(piece.len)) catch return error.OutOfMemory;
+        if (piece.len > 0) @memcpy(object.bytesOf(s)[0..piece.len], piece);
+        object.setSlot(pin_slot, @intCast(idx), s);
+    }
+    return pin_slot;
 }
 
 // Object>>perform: invokes selector (a Symbol or String) on the

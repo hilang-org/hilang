@@ -15,4 +15,5 @@ comptime {
     _ = @import("test_collections.zig");
     _ = @import("test_sockets.zig");
     _ = @import("test_json.zig");
+    _ = @import("test_strings.zig");
 }

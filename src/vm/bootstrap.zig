@@ -282,6 +282,13 @@ pub fn bootstrap(heap: *Heap) !Globals {
     try installPrim(heap, &g, g.object_class, "perform:", 1, prims.PRIM_OBJ_PERFORM);
     try installPrim(heap, &g, g.object_class, "asJson", 0, prims.PRIM_OBJ_AS_JSON);
     try installPrim(heap, &g, g.string_class, "asJsonValue", 0, prims.PRIM_STR_AS_JSON_VALUE);
+    try installPrim(heap, &g, g.string_class, "findString:", 1, prims.PRIM_STRING_INDEX_OF);
+    try installPrim(heap, &g, g.string_class, "subStrings:", 1, prims.PRIM_STRING_SUBSTRINGS);
+    try installPrim(heap, &g, g.string_class, "asUppercase", 0, prims.PRIM_STRING_AS_UPPERCASE);
+    try installPrim(heap, &g, g.string_class, "asLowercase", 0, prims.PRIM_STRING_AS_LOWERCASE);
+    try installPrim(heap, &g, g.string_class, "replaceAll:with:", 2, prims.PRIM_STRING_REPLACE_ALL);
+    try installPrim(heap, &g, g.string_class, "trimmed", 0, prims.PRIM_STRING_TRIMMED);
+    try installPrim(heap, &g, g.string_class, "endsWith:", 1, prims.PRIM_STRING_ENDS_WITH);
     try installPrim(heap, &g, g.class_class, "selectors", 0, prims.PRIM_BEHAVIOR_SELECTORS);
     try installPrim(heap, &g, g.string_class, "startsWith:", 1, prims.PRIM_STRING_STARTS_WITH);
     try installPrim(heap, &g, g.exception_class, "signal:", 1, prims.PRIM_EXC_SIGNAL);
