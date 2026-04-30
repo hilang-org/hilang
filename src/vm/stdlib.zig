@@ -161,6 +161,31 @@ fn defineClassAndRegister(
 pub fn loadSUnit(heap: *Heap, g: *Globals) !void {
     const c = Ctx{ .heap = heap, .g = g };
 
+    // ---- Message (reified failed send for DNU) ----
+    //
+    // Defined first so that any subsequent stdlib send that misses
+    // its target can dispatch through Object>>doesNotUnderstand:.
+    // In practice stdlib loads cleanly, but we want the safety
+    // net live before any user code runs.
+    const message_class = try defineClassAndRegister(heap, g, "Message", g.object_class, &.{ "selector", "arguments" });
+    g.message_class = message_class;
+    try defineMethod(c, message_class, "selector", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "selector")),
+    });
+    try defineMethod(c, message_class, "arguments", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "arguments")),
+    });
+
+    // Object>>doesNotUnderstand: aMessage
+    //   ^Exception new signal: 'doesNotUnderstand: ', aMessage selector asString
+    try defineMethod(c, g.object_class, "doesNotUnderstand:", &.{"aMessage"}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "Exception"), "new", &.{}), "signal:", &.{
+            try send(c, try litString(c, "doesNotUnderstand: "), ",", &.{
+                try send(c, try send(c, try varRef(c, "aMessage"), "selector", &.{}), "asString", &.{}),
+            }),
+        })),
+    });
+
     // ---- Number hierarchy ----
     //
     // Three abstract classes plus a reparenting of SmallInteger so that

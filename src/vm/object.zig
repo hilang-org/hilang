@@ -245,6 +245,13 @@ pub const PRIORITY_HIGH_IO: i64 = 6;
 pub const PRIORITY_TIMING: i64 = 7;
 pub const MAX_PRIORITY: u32 = 7;
 
+// Message { selector, arguments }
+//   selector   — Symbol of the message that wasn't understood.
+//   arguments  — Array of the call's argument oops.
+pub const SLOT_MESSAGE_SELECTOR: u32 = 0;
+pub const SLOT_MESSAGE_ARGUMENTS: u32 = 1;
+pub const MESSAGE_INST_SIZE: u32 = 2;
+
 pub inline fn headerOf(addr: Oop) *Header {
     return @ptrFromInt(addr);
 }

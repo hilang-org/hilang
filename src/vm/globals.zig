@@ -46,6 +46,9 @@ pub const Globals = struct {
     ret_node_class: Oop = oop_mod.NIL,
 
     exception_class: Oop = oop_mod.NIL,
+    // Reified failed send. The DNU dispatch path allocates one of
+    // these and hands it to the receiver's doesNotUnderstand:.
+    message_class: Oop = oop_mod.NIL,
 
     // Concurrency classes (loaded after the kernel is wired so their
     // metaclass parents already exist). The Processor singleton —
@@ -100,4 +103,6 @@ pub const Globals = struct {
     // Selector that the printNl primitive sends to dispatch through
     // the Smalltalk-side printOn: protocol (defined in stdlib).
     sym_printString: Oop = oop_mod.NIL,
+    // Slow-path DNU dispatch lookup uses this pre-interned symbol.
+    sym_does_not_understand: Oop = oop_mod.NIL,
 };

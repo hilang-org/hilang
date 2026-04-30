@@ -1638,8 +1638,39 @@ pub const Vm = struct {
 
     pub fn sendSymFrom(self: *Vm, receiver: Oop, start_class: Oop, sel_sym: Oop, args: []const Oop) EvalError!Oop {
         const method = method_mod.lookupBySym(start_class, sel_sym);
-        if (oop_mod.isNil(method)) return error.DoesNotUnderstand;
+        if (oop_mod.isNil(method)) return self.dispatchDoesNotUnderstand(receiver, start_class, sel_sym, args);
         return self.invokeMethod(method, receiver, args);
+    }
+
+    /// Slow path for unknown sends: reify the failed call as a
+    /// `Message` (selector + Array of arguments) and re-dispatch
+    /// `doesNotUnderstand:` against the receiver. If the receiver's
+    /// class chain has no `doesNotUnderstand:` method (only possible
+    /// on a malformed image where Object's default is gone),
+    /// surface the original Zig error.
+    fn dispatchDoesNotUnderstand(self: *Vm, receiver: Oop, start_class: Oop, sel_sym: Oop, args: []const Oop) EvalError!Oop {
+        const dnu_method = method_mod.lookupBySym(start_class, self.globals.sym_does_not_understand);
+        if (oop_mod.isNil(dnu_method)) return error.DoesNotUnderstand;
+        if (!oop_mod.isHeapPtr(self.globals.message_class)) return error.DoesNotUnderstand;
+
+        // Pin receiver/selector/args across the allocations below.
+        var recv_pin: Oop = receiver;
+        var sel_pin: Oop = sel_sym;
+        var args_arr_pin: Oop = oop_mod.NIL;
+        var msg_pin: Oop = oop_mod.NIL;
+        var slot_ptrs: [4]?*Oop = .{ &recv_pin, &sel_pin, &args_arr_pin, &msg_pin };
+        var pin = RootPin{ .parent = self.root_pin, .slots = &slot_ptrs, .n = 4 };
+        self.root_pin = &pin;
+        defer self.root_pin = pin.parent;
+
+        args_arr_pin = try self.heap.allocSlots(self.globals.array_class, @intCast(args.len));
+        for (args, 0..) |a, i| object.setSlot(args_arr_pin, @intCast(i), a);
+        msg_pin = try self.heap.allocSlots(self.globals.message_class, object.MESSAGE_INST_SIZE);
+        object.setSlot(msg_pin, object.SLOT_MESSAGE_SELECTOR, sel_pin);
+        object.setSlot(msg_pin, object.SLOT_MESSAGE_ARGUMENTS, args_arr_pin);
+
+        var dnu_args: [1]Oop = .{msg_pin};
+        return self.invokeMethod(dnu_method, recv_pin, &dnu_args);
     }
 
     // Test-only convenience: parse a JSON AST string and evaluate.

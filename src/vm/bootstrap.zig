@@ -145,6 +145,7 @@ pub fn bootstrap(heap: *Heap) !Globals {
     g.sym_gt = try dict_mod.newSymbol(heap, &g, ">");
     g.sym_ge = try dict_mod.newSymbol(heap, &g, ">=");
     g.sym_printString = try dict_mod.newSymbol(heap, &g, "printString");
+    g.sym_does_not_understand = try dict_mod.newSymbol(heap, &g, "doesNotUnderstand:");
 
     // ---- Phase 6: names. ----
     //

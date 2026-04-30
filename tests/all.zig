@@ -8,4 +8,5 @@ comptime {
     _ = @import("test_blocks.zig");
     _ = @import("test_warmup.zig");
     _ = @import("test_concurrency.zig");
+    _ = @import("test_dnu.zig");
 }
