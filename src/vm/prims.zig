@@ -113,6 +113,11 @@ pub const PRIM_PROCESSOR_YIELD: u32 = 230;
 pub const PRIM_PROCESSOR_ACTIVE: u32 = 231;
 pub const PRIM_TIME_MONO_NANOS: u32 = 240;
 pub const PRIM_DELAY_WAIT: u32 = 241;
+pub const PRIM_FS_OPEN: u32 = 300;
+pub const PRIM_FS_READ: u32 = 301;
+pub const PRIM_FS_READ_ALL: u32 = 302;
+pub const PRIM_FS_WRITE: u32 = 303;
+pub const PRIM_FS_CLOSE: u32 = 304;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -205,6 +210,11 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_PROCESSOR_ACTIVE => primProcessorActive(vm, receiver, args),
         PRIM_TIME_MONO_NANOS => primTimeMonoNanos(vm, receiver, args),
         PRIM_DELAY_WAIT => primDelayWait(vm, receiver, args),
+        PRIM_FS_OPEN => primFsOpen(vm, receiver, args),
+        PRIM_FS_READ => primFsRead(vm, receiver, args),
+        PRIM_FS_READ_ALL => primFsReadAll(vm, receiver, args),
+        PRIM_FS_WRITE => primFsWrite(vm, receiver, args),
+        PRIM_FS_CLOSE => primFsClose(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1315,6 +1325,147 @@ fn primTimeMonoNanos(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
     const nanos = eval_mod.monotonicNanos();
     if (!oop_mod.fitsSmallInt(nanos)) return error.PrimitiveFailed;
     return oop_mod.fromInt(nanos);
+}
+
+// File-stream primitives. Receiver is a FileStream instance whose
+// first ivar slot (index 0, "fd") holds the underlying SmallInt fd
+// — these prims read it directly and avoid an arg shuffle. Path
+// strings are copied through a 4 KiB stack buffer so we can hand
+// a null-terminated `[*:0]const u8` to `openatZ`; longer paths
+// fail with PrimitiveFailed (good enough for an LLM-driven VM).
+const FS_PATH_MAX: usize = 4096;
+const FS_FD_SLOT: u32 = 0;
+
+fn fsCopyPathZ(buf: *[FS_PATH_MAX]u8, path_oop: Oop) PrimError![*:0]const u8 {
+    if (!oop_mod.isHeapPtr(path_oop)) return error.TypeError;
+    const hdr = object.headerOf(path_oop);
+    if ((hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    if (hdr.size + 1 > FS_PATH_MAX) return error.PrimitiveFailed;
+    const src = object.bytesOf(path_oop)[0..hdr.size];
+    @memcpy(buf[0..src.len], src);
+    buf[src.len] = 0;
+    return @ptrCast(buf);
+}
+
+fn fsFdOf(receiver: Oop) PrimError!std.posix.fd_t {
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const fd_oop = object.slot(receiver, FS_FD_SLOT);
+    if (!oop_mod.isInt(fd_oop)) return error.TypeError;
+    const fd = oop_mod.toInt(fd_oop);
+    if (fd < 0) return error.PrimitiveFailed;
+    return @intCast(fd);
+}
+
+// FileStream>>primOpenPath: aPath mode: aMode
+//   modes: 0 = read-only; 1 = write+truncate; 2 = write+append.
+//   Stores the fd into the receiver's `fd` ivar and returns receiver.
+fn primFsOpen(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    _ = vm;
+    if (args.len != 2) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    if (!oop_mod.isInt(args[1])) return error.TypeError;
+    var path_buf: [FS_PATH_MAX]u8 = undefined;
+    const path_z = try fsCopyPathZ(&path_buf, args[0]);
+
+    var flags: std.posix.O = .{};
+    var perm: std.posix.mode_t = 0;
+    switch (oop_mod.toInt(args[1])) {
+        0 => flags.ACCMODE = .RDONLY,
+        1 => {
+            flags.ACCMODE = .WRONLY;
+            flags.CREAT = true;
+            flags.TRUNC = true;
+            perm = 0o644;
+        },
+        2 => {
+            flags.ACCMODE = .WRONLY;
+            flags.CREAT = true;
+            flags.APPEND = true;
+            perm = 0o644;
+        },
+        else => return error.PrimitiveFailed,
+    }
+    const fd = std.posix.openatZ(std.posix.AT.FDCWD, path_z, flags, perm) catch return error.PrimitiveFailed;
+    object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
+    return receiver;
+}
+
+// FileStream>>read: aMaxBytes  → String of up to aMaxBytes from fd.
+// Empty String on EOF. Capped at 1 GiB to keep allocation sane.
+fn primFsRead(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const fd = try fsFdOf(receiver);
+    const max_int = oop_mod.toInt(args[0]);
+    if (max_int < 0 or max_int > 1 << 30) return error.PrimitiveFailed;
+    const max: usize = @intCast(max_int);
+
+    const tmp = std.heap.page_allocator.alloc(u8, max) catch return error.OutOfMemory;
+    defer std.heap.page_allocator.free(tmp);
+    const n = std.posix.read(fd, tmp) catch return error.PrimitiveFailed;
+    const result = try vm.heap.allocBytes(vm.globals.string_class, @intCast(n));
+    if (n > 0) @memcpy(object.bytesOf(result)[0..n], tmp[0..n]);
+    return result;
+}
+
+// FileStream>>readAll  → String of all remaining bytes from fd.
+// Streams in 4 KiB chunks into a Zig ArrayList so we don't need
+// fstat. Returns an empty String on an already-EOF fd.
+fn primFsReadAll(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    const fd = try fsFdOf(receiver);
+
+    const alloc = std.heap.page_allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(fd, &chunk) catch return error.PrimitiveFailed;
+        if (n == 0) break;
+        buf.appendSlice(alloc, chunk[0..n]) catch return error.OutOfMemory;
+    }
+    const result = try vm.heap.allocBytes(vm.globals.string_class, @intCast(buf.items.len));
+    if (buf.items.len > 0) @memcpy(object.bytesOf(result)[0..buf.items.len], buf.items);
+    return result;
+}
+
+// FileStream>>nextPutAll: aString  — write the byte payload to fd
+// in a loop until it's all out. Returns receiver so chains compose.
+fn primFsWrite(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    _ = vm;
+    if (args.len != 1) return error.ArityMismatch;
+    const fd = try fsFdOf(receiver);
+    if (!oop_mod.isHeapPtr(args[0])) return error.TypeError;
+    const hdr = object.headerOf(args[0]);
+    if ((hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const bytes = object.bytesOf(args[0])[0..hdr.size];
+
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const rc = std.posix.system.write(fd, bytes.ptr + written, bytes.len - written);
+        if (rc < 0) return error.PrimitiveFailed;
+        if (rc == 0) break;
+        written += @intCast(rc);
+    }
+    return receiver;
+}
+
+// FileStream>>primClose  — close the fd and set the slot to -1 so
+// subsequent ops fail predictably. Idempotent on an already-closed
+// FileStream (fd == -1).
+fn primFsClose(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    _ = vm;
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const fd_oop = object.slot(receiver, FS_FD_SLOT);
+    if (oop_mod.isInt(fd_oop)) {
+        const fd = oop_mod.toInt(fd_oop);
+        if (fd >= 0) {
+            _ = std.posix.system.close(@intCast(fd));
+        }
+    }
+    object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(-1));
+    return receiver;
 }
 
 // Delay>>wait — park the active Process on the scheduler's sorted

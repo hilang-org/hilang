@@ -58,6 +58,7 @@ pub const Globals = struct {
     semaphore_class: Oop = oop_mod.NIL,
     scheduler_class: Oop = oop_mod.NIL,
     processor: Oop = oop_mod.NIL,
+    file_stream_class: Oop = oop_mod.NIL,
 
     // Pre-interned state symbols — read by Vm.invokeBlock's fork path
     // and by the wait/signal primitives.

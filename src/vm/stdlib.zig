@@ -2367,4 +2367,50 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
             try send(c, try varRef(c, "s"), "*", &.{try litInt(c, 1_000)}),
         })),
     });
+
+    // ---- FileStream ----
+    //
+    // Thin Smalltalk wrapper over a POSIX fd. The single ivar `fd`
+    // stores a SmallInt; primitives wired in bootstrap.zig read it
+    // directly from slot 0. After `close`, fd is set to -1 so any
+    // subsequent prim call surfaces a clean PrimitiveFailed.
+    const file_stream_class = try defineClassAndRegister(
+        heap,
+        g,
+        "FileStream",
+        g.object_class,
+        &.{"fd"},
+    );
+    g.file_stream_class = file_stream_class;
+
+    // close wraps the primitive, then nils out the fd ivar.
+    try defineMethod(c, file_stream_class, "close", &.{}, &.{}, &.{
+        try send(c, try varRef(c, "self"), "primClose", &.{}),
+        try assignNode(c, "fd", try litInt(c, -1)),
+        try ret(c, try varRef(c, "self")),
+    });
+    try defineMethod(c, file_stream_class, "contents", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "readAll", &.{})),
+    });
+    try defineMethod(c, file_stream_class, "fd", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "fd")),
+    });
+
+    // Class-side factories for the three open modes.
+    const fs_meta = object.headerOf(file_stream_class).class;
+    try defineMethod(c, fs_meta, "read:", &.{"aPath"}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "primOpenPath:mode:", &.{
+            try varRef(c, "aPath"), try litInt(c, 0),
+        })),
+    });
+    try defineMethod(c, fs_meta, "write:", &.{"aPath"}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "primOpenPath:mode:", &.{
+            try varRef(c, "aPath"), try litInt(c, 1),
+        })),
+    });
+    try defineMethod(c, fs_meta, "append:", &.{"aPath"}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "primOpenPath:mode:", &.{
+            try varRef(c, "aPath"), try litInt(c, 2),
+        })),
+    });
 }

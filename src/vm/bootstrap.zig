@@ -350,6 +350,16 @@ pub fn bootstrap(heap: *Heap) !Globals {
         try installPrim(heap, &g, delay_cls, "wait", 0, prims.PRIM_DELAY_WAIT);
     }
 
+    // FileStream primitives. Receiver is a FileStream; slot 0 (`fd`)
+    // is the underlying POSIX file descriptor.
+    if (oop_mod.isHeapPtr(g.file_stream_class)) {
+        try installPrim(heap, &g, g.file_stream_class, "primOpenPath:mode:", 2, prims.PRIM_FS_OPEN);
+        try installPrim(heap, &g, g.file_stream_class, "read:", 1, prims.PRIM_FS_READ);
+        try installPrim(heap, &g, g.file_stream_class, "readAll", 0, prims.PRIM_FS_READ_ALL);
+        try installPrim(heap, &g, g.file_stream_class, "nextPutAll:", 1, prims.PRIM_FS_WRITE);
+        try installPrim(heap, &g, g.file_stream_class, "primClose", 0, prims.PRIM_FS_CLOSE);
+    }
+
     // Seal the image header so a second bootstrap attempt fails fast,
     // and a future image loader can find Smalltalk without scanning.
     const hdr = heap.imageHeader();
