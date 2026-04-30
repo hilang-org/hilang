@@ -275,6 +275,10 @@ pub fn bootstrap(heap: *Heap) !Globals {
     try installPrim(heap, &g, g.object_class, "=", 1, prims.PRIM_OBJ_IDENTITY_EQ);
     try installPrim(heap, &g, g.object_class, "become:", 1, prims.PRIM_OBJ_BECOME);
     try installPrim(heap, &g, g.object_class, "isKindOf:", 1, prims.PRIM_OBJ_IS_KIND_OF);
+    try installPrim(heap, &g, g.object_class, "isMemberOf:", 1, prims.PRIM_OBJ_IS_MEMBER_OF);
+    try installPrim(heap, &g, g.object_class, "instVarAt:", 1, prims.PRIM_OBJ_INST_VAR_AT);
+    try installPrim(heap, &g, g.object_class, "instVarAt:put:", 2, prims.PRIM_OBJ_INST_VAR_AT_PUT);
+    try installPrim(heap, &g, g.behavior_class, "instVarNames", 0, prims.PRIM_BEHAVIOR_INST_VAR_NAMES);
     try installPrim(heap, &g, g.object_class, "perform:", 1, prims.PRIM_OBJ_PERFORM);
     try installPrim(heap, &g, g.class_class, "selectors", 0, prims.PRIM_BEHAVIOR_SELECTORS);
     try installPrim(heap, &g, g.string_class, "startsWith:", 1, prims.PRIM_STRING_STARTS_WITH);

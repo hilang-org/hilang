@@ -118,6 +118,10 @@ pub const PRIM_FS_READ: u32 = 301;
 pub const PRIM_FS_READ_ALL: u32 = 302;
 pub const PRIM_FS_WRITE: u32 = 303;
 pub const PRIM_FS_CLOSE: u32 = 304;
+pub const PRIM_OBJ_INST_VAR_AT: u32 = 310;
+pub const PRIM_OBJ_INST_VAR_AT_PUT: u32 = 311;
+pub const PRIM_OBJ_IS_MEMBER_OF: u32 = 312;
+pub const PRIM_BEHAVIOR_INST_VAR_NAMES: u32 = 313;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -215,6 +219,10 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_FS_READ_ALL => primFsReadAll(vm, receiver, args),
         PRIM_FS_WRITE => primFsWrite(vm, receiver, args),
         PRIM_FS_CLOSE => primFsClose(vm, receiver, args),
+        PRIM_OBJ_INST_VAR_AT => primObjInstVarAt(vm, receiver, args),
+        PRIM_OBJ_INST_VAR_AT_PUT => primObjInstVarAtPut(vm, receiver, args),
+        PRIM_OBJ_IS_MEMBER_OF => primObjIsMemberOf(vm, receiver, args),
+        PRIM_BEHAVIOR_INST_VAR_NAMES => primBehaviorInstVarNames(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1325,6 +1333,68 @@ fn primTimeMonoNanos(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
     const nanos = eval_mod.monotonicNanos();
     if (!oop_mod.fitsSmallInt(nanos)) return error.PrimitiveFailed;
     return oop_mod.fromInt(nanos);
+}
+
+// Object>>instVarAt: i  — 1-based slot read. For byte-objects
+// (String, ByteArray, Symbol) returns the byte as a SmallInt to
+// mirror Pharo. SmallIntegers / sentinels have no slots and
+// raise PrimitiveFailed.
+fn primObjInstVarAt(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.PrimitiveFailed;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const i = oop_mod.toInt(args[0]);
+    if (i < 1) return error.PrimitiveFailed;
+    const idx: u32 = @intCast(i - 1);
+    const hdr = object.headerOf(receiver);
+    if (idx >= hdr.size) return error.PrimitiveFailed;
+    if ((hdr.flags & object.FLAG_BYTES) != 0) {
+        return oop_mod.fromInt(@intCast(object.bytesOf(receiver)[idx]));
+    }
+    return object.slot(receiver, idx);
+}
+
+// Object>>instVarAt: i put: anObject  — 1-based slot store.
+// For byte-objects, anObject must be a SmallInt 0..255. Returns
+// the stored value (consistent with at:put: convention).
+fn primObjInstVarAtPut(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 2) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.PrimitiveFailed;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const i = oop_mod.toInt(args[0]);
+    if (i < 1) return error.PrimitiveFailed;
+    const idx: u32 = @intCast(i - 1);
+    const hdr = object.headerOf(receiver);
+    if (idx >= hdr.size) return error.PrimitiveFailed;
+    if ((hdr.flags & object.FLAG_BYTES) != 0) {
+        if (!oop_mod.isInt(args[1])) return error.TypeError;
+        const b = oop_mod.toInt(args[1]);
+        if (b < 0 or b > 255) return error.PrimitiveFailed;
+        object.bytesOf(receiver)[idx] = @intCast(b);
+        return args[1];
+    }
+    object.setSlot(receiver, idx, args[1]);
+    return args[1];
+}
+
+// Object>>isMemberOf: aClass  — exact class match (unlike
+// isKindOf: which walks the superclass chain).
+fn primObjIsMemberOf(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    return oop_mod.fromBool(vm.classOf(receiver) == args[0]);
+}
+
+// Behavior>>instVarNames  — Array of Symbols naming each
+// non-byte instance variable, in slot order. Returns an empty
+// Array when the class has none. Receiver must be a class.
+fn primBehaviorInstVarNames(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const names = object.slot(receiver, object.SLOT_CLASS_IVAR_NAMES);
+    if (oop_mod.isHeapPtr(names)) return names;
+    // Class predates ivar-names tracking; return an empty Array
+    // rather than NIL so callers can iterate uniformly.
+    return vm.heap.allocSlots(vm.globals.array_class, 0) catch error.OutOfMemory;
 }
 
 // File-stream primitives. Receiver is a FileStream instance whose
