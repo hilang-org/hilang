@@ -367,6 +367,19 @@ pub fn bootstrap(heap: *Heap) !Globals {
         try installPrim(heap, &g, g.file_stream_class, "primClose", 0, prims.PRIM_FS_CLOSE);
     }
 
+    // Socket primitives. Same fd-at-slot-0 convention so the
+    // read/write/close primitives reuse the FileStream prim
+    // functions; only connect/listen/accept are net-specific.
+    if (oop_mod.isHeapPtr(g.socket_class)) {
+        try installPrim(heap, &g, g.socket_class, "primConnect:port:", 2, prims.PRIM_SOCK_CONNECT);
+        try installPrim(heap, &g, g.socket_class, "primListen:", 1, prims.PRIM_SOCK_LISTEN);
+        try installPrim(heap, &g, g.socket_class, "accept", 0, prims.PRIM_SOCK_ACCEPT);
+        try installPrim(heap, &g, g.socket_class, "read:", 1, prims.PRIM_FS_READ);
+        try installPrim(heap, &g, g.socket_class, "readAll", 0, prims.PRIM_FS_READ_ALL);
+        try installPrim(heap, &g, g.socket_class, "nextPutAll:", 1, prims.PRIM_FS_WRITE);
+        try installPrim(heap, &g, g.socket_class, "primClose", 0, prims.PRIM_FS_CLOSE);
+    }
+
     // Seal the image header so a second bootstrap attempt fails fast,
     // and a future image loader can find Smalltalk without scanning.
     const hdr = heap.imageHeader();

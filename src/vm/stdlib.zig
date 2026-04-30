@@ -2680,4 +2680,47 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
             try varRef(c, "aPath"), try litInt(c, 2),
         })),
     });
+
+    // ---- Socket ----
+    //
+    // TCP/IPv4 endpoint over a POSIX fd. Same fd-at-slot-0
+    // convention as FileStream so the read:/readAll/nextPutAll:/
+    // primClose primitives (installed on Socket below in
+    // bootstrap.zig) operate on the underlying socket. Class
+    // side: `connectTo:port:` (IPv4 dotted literal) and
+    // `listenOn:`. Instance side: `accept` (returns a new
+    // connected Socket), `close`, `contents`, `fd`.
+    const socket_class = try defineClassAndRegister(
+        heap,
+        g,
+        "Socket",
+        g.object_class,
+        &.{"fd"},
+    );
+    g.socket_class = socket_class;
+
+    try defineMethod(c, socket_class, "close", &.{}, &.{}, &.{
+        try send(c, try varRef(c, "self"), "primClose", &.{}),
+        try assignNode(c, "fd", try litInt(c, -1)),
+        try ret(c, try varRef(c, "self")),
+    });
+    try defineMethod(c, socket_class, "contents", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "readAll", &.{})),
+    });
+    try defineMethod(c, socket_class, "fd", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "fd")),
+    });
+
+    // Class-side factories.
+    const sock_meta = object.headerOf(socket_class).class;
+    try defineMethod(c, sock_meta, "connectTo:port:", &.{ "aHost", "aPort" }, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "primConnect:port:", &.{
+            try varRef(c, "aHost"), try varRef(c, "aPort"),
+        })),
+    });
+    try defineMethod(c, sock_meta, "listenOn:", &.{"aPort"}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "primListen:", &.{
+            try varRef(c, "aPort"),
+        })),
+    });
 }

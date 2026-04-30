@@ -13,4 +13,5 @@ comptime {
     _ = @import("test_reflection.zig");
     _ = @import("test_exceptions.zig");
     _ = @import("test_collections.zig");
+    _ = @import("test_sockets.zig");
 }

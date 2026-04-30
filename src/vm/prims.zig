@@ -125,6 +125,9 @@ pub const PRIM_BEHAVIOR_INST_VAR_NAMES: u32 = 313;
 pub const PRIM_BLOCK_IF_CURTAILED: u32 = 320;
 pub const PRIM_EXC_PASS: u32 = 321;
 pub const PRIM_EXC_RESIGNAL_AS: u32 = 322;
+pub const PRIM_SOCK_CONNECT: u32 = 330;
+pub const PRIM_SOCK_LISTEN: u32 = 331;
+pub const PRIM_SOCK_ACCEPT: u32 = 332;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -229,6 +232,9 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_BLOCK_IF_CURTAILED => primBlockIfCurtailed(vm, receiver, args),
         PRIM_EXC_PASS => primExceptionPass(vm, receiver, args),
         PRIM_EXC_RESIGNAL_AS => primExceptionResignalAs(vm, receiver, args),
+        PRIM_SOCK_CONNECT => primSockConnect(vm, receiver, args),
+        PRIM_SOCK_LISTEN => primSockListen(vm, receiver, args),
+        PRIM_SOCK_ACCEPT => primSockAccept(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1379,6 +1385,122 @@ fn primTimeMonoNanos(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
     const nanos = eval_mod.monotonicNanos();
     if (!oop_mod.fitsSmallInt(nanos)) return error.PrimitiveFailed;
     return oop_mod.fromInt(nanos);
+}
+
+// IPv4 socket primitives. Receiver is a Socket whose first ivar
+// (slot 0) holds the underlying fd — same convention as
+// FileStream so the read:/readAll/nextPutAll:/primClose prims
+// installed on Socket below operate on the fd. Hostnames must
+// be dotted IPv4 literals; DNS resolution is out of scope for
+// this commit.
+
+fn parseIp4(s: []const u8) ?u32 {
+    var parts: [4]u32 = undefined;
+    var idx: u32 = 0;
+    var cur: u32 = 0;
+    var saw: bool = false;
+    var p: usize = 0;
+    while (p < s.len) : (p += 1) {
+        const ch = s[p];
+        if (ch >= '0' and ch <= '9') {
+            cur = cur * 10 + (ch - '0');
+            if (cur > 255) return null;
+            saw = true;
+        } else if (ch == '.') {
+            if (!saw or idx >= 3) return null;
+            parts[idx] = cur;
+            idx += 1;
+            cur = 0;
+            saw = false;
+        } else return null;
+    }
+    if (!saw or idx != 3) return null;
+    parts[3] = cur;
+    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+}
+
+fn buildSockaddrIn(ip_be: u32, port: u16) std.posix.sockaddr.in {
+    return .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, ip_be),
+    };
+}
+
+// Socket>>primConnect: aHost port: aPort
+//   aHost must be a dotted IPv4 string (DNS not yet supported).
+//   Stores the connected fd into the receiver's slot 0 and
+//   returns the receiver so chains compose.
+fn primSockConnect(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 2) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    if (!oop_mod.isHeapPtr(args[0])) return error.TypeError;
+    if (!oop_mod.isInt(args[1])) return error.TypeError;
+    const host_hdr = object.headerOf(args[0]);
+    if ((host_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const host_bytes = object.bytesOf(args[0])[0..host_hdr.size];
+    const ip = parseIp4(host_bytes) orelse return error.PrimitiveFailed;
+    const port_int = oop_mod.toInt(args[1]);
+    if (port_int < 0 or port_int > 65535) return error.PrimitiveFailed;
+
+    const fd = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.PrimitiveFailed;
+    const sa = buildSockaddrIn(ip, @intCast(port_int));
+    const sa_ptr: *const std.posix.sockaddr = @ptrCast(&sa);
+    if (std.posix.system.connect(fd, sa_ptr, @sizeOf(@TypeOf(sa))) != 0) {
+        _ = std.posix.system.close(fd);
+        return error.PrimitiveFailed;
+    }
+    object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
+    return receiver;
+}
+
+// Socket>>primListen: aPort  — bind to 0.0.0.0:aPort with
+// SO_REUSEADDR, then listen with backlog 16. Stores the
+// listening fd into the receiver's slot 0.
+fn primSockListen(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const port_int = oop_mod.toInt(args[0]);
+    if (port_int < 0 or port_int > 65535) return error.PrimitiveFailed;
+
+    const fd = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    if (fd < 0) return error.PrimitiveFailed;
+    const reuse: c_int = 1;
+    _ = std.posix.system.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &reuse, @sizeOf(c_int));
+    const sa = buildSockaddrIn(0, @intCast(port_int));
+    const sa_ptr: *const std.posix.sockaddr = @ptrCast(&sa);
+    if (std.posix.system.bind(fd, sa_ptr, @sizeOf(@TypeOf(sa))) != 0) {
+        _ = std.posix.system.close(fd);
+        return error.PrimitiveFailed;
+    }
+    if (std.posix.system.listen(fd, 16) != 0) {
+        _ = std.posix.system.close(fd);
+        return error.PrimitiveFailed;
+    }
+    object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
+    return receiver;
+}
+
+// Socket>>accept  — block on the listener's accept(), then
+// allocate a fresh Socket whose fd is the new connected fd.
+// Returns the new Socket; the receiver remains the listener.
+fn primSockAccept(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const listen_fd = try fsFdOf(receiver);
+    const cli_fd = std.posix.system.accept(listen_fd, null, null);
+    if (cli_fd < 0) return error.PrimitiveFailed;
+    if (!oop_mod.isHeapPtr(vm.globals.socket_class)) {
+        _ = std.posix.system.close(cli_fd);
+        return error.PrimitiveFailed;
+    }
+    const sock = vm.heap.allocSlots(vm.globals.socket_class, 1) catch {
+        _ = std.posix.system.close(cli_fd);
+        return error.OutOfMemory;
+    };
+    object.setSlot(sock, FS_FD_SLOT, oop_mod.fromInt(@intCast(cli_fd)));
+    return sock;
 }
 
 // Object>>instVarAt: i  — 1-based slot read. For byte-objects
