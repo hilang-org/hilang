@@ -128,6 +128,8 @@ pub const PRIM_EXC_RESIGNAL_AS: u32 = 322;
 pub const PRIM_SOCK_CONNECT: u32 = 330;
 pub const PRIM_SOCK_LISTEN: u32 = 331;
 pub const PRIM_SOCK_ACCEPT: u32 = 332;
+pub const PRIM_STR_AS_JSON_VALUE: u32 = 340;
+pub const PRIM_OBJ_AS_JSON: u32 = 341;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -235,6 +237,8 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_SOCK_CONNECT => primSockConnect(vm, receiver, args),
         PRIM_SOCK_LISTEN => primSockListen(vm, receiver, args),
         PRIM_SOCK_ACCEPT => primSockAccept(vm, receiver, args),
+        PRIM_STR_AS_JSON_VALUE => primStrAsJsonValue(vm, receiver, args),
+        PRIM_OBJ_AS_JSON => primObjAsJson(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1508,6 +1512,203 @@ fn primSockAccept(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     };
     object.setSlot(sock, FS_FD_SLOT, oop_mod.fromInt(@intCast(cli_fd)));
     return sock;
+}
+
+// JSON primitives. The std.json parser produces a Value tree;
+// jsonValueToOop walks it and allocates equivalent heap objects:
+// nil/true/false → sentinels, integers → SmallInt (or
+// PrimitiveFailed on overflow — JSON-from-LLM rarely needs i64),
+// floats → tagged Float, strings → String oops, arrays → Array
+// oops, objects → Dictionary oops keyed by interned Symbols.
+// stringify is the inverse: a recursive emit into a Zig
+// ArrayList(u8) followed by a single allocBytes for the result.
+
+fn jsonValueToOop(vm: *Vm, v: std.json.Value) PrimError!Oop {
+    switch (v) {
+        .null => return oop_mod.NIL,
+        .bool => |b| return oop_mod.fromBool(b),
+        .integer => |i| {
+            if (!oop_mod.fitsSmallInt(i)) return error.PrimitiveFailed;
+            return oop_mod.fromInt(i);
+        },
+        .float => |f| return oop_mod.fromF64(f),
+        .number_string => return error.PrimitiveFailed,
+        .string => |s| {
+            const result = vm.heap.allocBytes(vm.globals.string_class, @intCast(s.len)) catch return error.OutOfMemory;
+            if (s.len > 0) @memcpy(object.bytesOf(result)[0..s.len], s);
+            return result;
+        },
+        .array => |arr| {
+            const result = vm.heap.allocSlots(vm.globals.array_class, @intCast(arr.items.len)) catch return error.OutOfMemory;
+            // Pin result across recursive allocations.
+            var pin_slot: Oop = result;
+            var slot_ptrs: [1]?*Oop = .{&pin_slot};
+            var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 1 };
+            vm.root_pin = &pin;
+            defer vm.root_pin = pin.parent;
+            for (arr.items, 0..) |item, i| {
+                const child = try jsonValueToOop(vm, item);
+                object.setSlot(pin_slot, @intCast(i), child);
+            }
+            return pin_slot;
+        },
+        .object => |obj| {
+            const cap_min: u32 = @intCast(@max(@as(usize, 8), obj.count() * 2));
+            const result = dict.newDictionary(vm.heap, vm.globals.dictionary_class, vm.globals.array_class, cap_min) catch return error.OutOfMemory;
+            var pin_slot: Oop = result;
+            var slot_ptrs: [1]?*Oop = .{&pin_slot};
+            var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 1 };
+            vm.root_pin = &pin;
+            defer vm.root_pin = pin.parent;
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const child = try jsonValueToOop(vm, entry.value_ptr.*);
+                _ = dict.atPut(vm.heap, pin_slot, &vm.globals, entry.key_ptr.*, child) catch return error.OutOfMemory;
+            }
+            return pin_slot;
+        },
+    }
+}
+
+// String>>asJsonValue — parse the receiver's bytes as JSON and
+// return the equivalent hilang object tree.
+fn primStrAsJsonValue(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const hdr = object.headerOf(receiver);
+    if ((hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const bytes = object.bytesOf(receiver)[0..hdr.size];
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), bytes, .{}) catch return error.PrimitiveFailed;
+    defer parsed.deinit();
+    return jsonValueToOop(vm, parsed.value);
+}
+
+// Recursive emitter. Walks a hilang oop and appends JSON bytes
+// to `buf`. Recognised shapes: nil/true/false sentinels,
+// SmallInt, tagged Float, String/Symbol bytes, Array slots,
+// Dictionary key/value pairs. Any other heap class falls back
+// to {"__class__": <name>} so the emit never raw-fails.
+fn jsonEmit(vm: *Vm, oop: Oop, buf: *std.ArrayList(u8), alloc: std.mem.Allocator) PrimError!void {
+    if (oop_mod.isNil(oop)) {
+        buf.appendSlice(alloc, "null") catch return error.OutOfMemory;
+        return;
+    }
+    if (oop == oop_mod.TRUE) {
+        buf.appendSlice(alloc, "true") catch return error.OutOfMemory;
+        return;
+    }
+    if (oop == oop_mod.FALSE) {
+        buf.appendSlice(alloc, "false") catch return error.OutOfMemory;
+        return;
+    }
+    if (oop_mod.isInt(oop)) {
+        var tmp: [24]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "{d}", .{oop_mod.toInt(oop)}) catch return error.PrimitiveFailed;
+        buf.appendSlice(alloc, s) catch return error.OutOfMemory;
+        return;
+    }
+    if (oop_mod.isFloat(oop)) {
+        var tmp: [40]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, "{d}", .{oop_mod.toF64(oop)}) catch return error.PrimitiveFailed;
+        buf.appendSlice(alloc, s) catch return error.OutOfMemory;
+        return;
+    }
+    if (!oop_mod.isHeapPtr(oop)) {
+        buf.appendSlice(alloc, "null") catch return error.OutOfMemory;
+        return;
+    }
+    const hdr = object.headerOf(oop);
+    const cls = hdr.class;
+    // String / Symbol → quoted JSON string with minimal escaping.
+    if (cls == vm.globals.string_class or cls == vm.globals.symbol_class) {
+        const bytes = object.bytesOf(oop)[0..hdr.size];
+        buf.append(alloc, '"') catch return error.OutOfMemory;
+        for (bytes) |b| {
+            if (b == '"') {
+                buf.appendSlice(alloc, "\\\"") catch return error.OutOfMemory;
+            } else if (b == '\\') {
+                buf.appendSlice(alloc, "\\\\") catch return error.OutOfMemory;
+            } else if (b == '\n') {
+                buf.appendSlice(alloc, "\\n") catch return error.OutOfMemory;
+            } else if (b == '\r') {
+                buf.appendSlice(alloc, "\\r") catch return error.OutOfMemory;
+            } else if (b == '\t') {
+                buf.appendSlice(alloc, "\\t") catch return error.OutOfMemory;
+            } else if (b < 0x20) {
+                var ux: [6]u8 = undefined;
+                const s = std.fmt.bufPrint(&ux, "\\u{x:0>4}", .{b}) catch return error.PrimitiveFailed;
+                buf.appendSlice(alloc, s) catch return error.OutOfMemory;
+            } else {
+                buf.append(alloc, b) catch return error.OutOfMemory;
+            }
+        }
+        buf.append(alloc, '"') catch return error.OutOfMemory;
+        return;
+    }
+    // Array → JSON array.
+    if (cls == vm.globals.array_class) {
+        buf.append(alloc, '[') catch return error.OutOfMemory;
+        var i: u32 = 0;
+        while (i < hdr.size) : (i += 1) {
+            if (i > 0) buf.append(alloc, ',') catch return error.OutOfMemory;
+            try jsonEmit(vm, object.slot(oop, i), buf, alloc);
+        }
+        buf.append(alloc, ']') catch return error.OutOfMemory;
+        return;
+    }
+    // Dictionary → JSON object. Iterate keys/values arrays in
+    // their stored order; insertion order is preserved by
+    // dict.atPut for moderate-load dictionaries.
+    if (cls == vm.globals.dictionary_class) {
+        const keys = object.slot(oop, object.SLOT_DICT_KEYS);
+        const values = object.slot(oop, object.SLOT_DICT_VALUES);
+        const count_oop = object.slot(oop, object.SLOT_DICT_COUNT);
+        if (!oop_mod.isHeapPtr(keys) or !oop_mod.isHeapPtr(values) or !oop_mod.isInt(count_oop)) {
+            buf.appendSlice(alloc, "{}") catch return error.OutOfMemory;
+            return;
+        }
+        const count: u32 = @intCast(oop_mod.toInt(count_oop));
+        buf.append(alloc, '{') catch return error.OutOfMemory;
+        var idx: u32 = 0;
+        var emitted: u32 = 0;
+        while (idx < count) : (idx += 1) {
+            const k = object.slot(keys, idx);
+            if (oop_mod.isNil(k)) continue;
+            if (emitted > 0) buf.append(alloc, ',') catch return error.OutOfMemory;
+            try jsonEmit(vm, k, buf, alloc);
+            buf.append(alloc, ':') catch return error.OutOfMemory;
+            try jsonEmit(vm, object.slot(values, idx), buf, alloc);
+            emitted += 1;
+        }
+        buf.append(alloc, '}') catch return error.OutOfMemory;
+        return;
+    }
+    // Fallback for other heap classes: emit a tagged stub so the
+    // caller sees something self-describing rather than failing.
+    buf.appendSlice(alloc, "{\"__class__\":\"") catch return error.OutOfMemory;
+    const name_oop = object.slot(cls, object.SLOT_NAME);
+    if (oop_mod.isHeapPtr(name_oop)) {
+        const name_hdr = object.headerOf(name_oop);
+        if ((name_hdr.flags & object.FLAG_BYTES) != 0) {
+            buf.appendSlice(alloc, object.bytesOf(name_oop)[0..name_hdr.size]) catch return error.OutOfMemory;
+        }
+    }
+    buf.appendSlice(alloc, "\"}") catch return error.OutOfMemory;
+}
+
+// Object>>asJson — emit the receiver as a JSON String.
+fn primObjAsJson(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    const alloc = std.heap.page_allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(alloc);
+    try jsonEmit(vm, receiver, &buf, alloc);
+    const result = vm.heap.allocBytes(vm.globals.string_class, @intCast(buf.items.len)) catch return error.OutOfMemory;
+    if (buf.items.len > 0) @memcpy(object.bytesOf(result)[0..buf.items.len], buf.items);
+    return result;
 }
 
 // Object>>instVarAt: i  — 1-based slot read. For byte-objects

@@ -280,6 +280,8 @@ pub fn bootstrap(heap: *Heap) !Globals {
     try installPrim(heap, &g, g.object_class, "instVarAt:put:", 2, prims.PRIM_OBJ_INST_VAR_AT_PUT);
     try installPrim(heap, &g, g.behavior_class, "instVarNames", 0, prims.PRIM_BEHAVIOR_INST_VAR_NAMES);
     try installPrim(heap, &g, g.object_class, "perform:", 1, prims.PRIM_OBJ_PERFORM);
+    try installPrim(heap, &g, g.object_class, "asJson", 0, prims.PRIM_OBJ_AS_JSON);
+    try installPrim(heap, &g, g.string_class, "asJsonValue", 0, prims.PRIM_STR_AS_JSON_VALUE);
     try installPrim(heap, &g, g.class_class, "selectors", 0, prims.PRIM_BEHAVIOR_SELECTORS);
     try installPrim(heap, &g, g.string_class, "startsWith:", 1, prims.PRIM_STRING_STARTS_WITH);
     try installPrim(heap, &g, g.exception_class, "signal:", 1, prims.PRIM_EXC_SIGNAL);
