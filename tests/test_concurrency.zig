@@ -324,3 +324,97 @@ test "Priority constants are bound in Smalltalk" {
     try expectInt(&env, 3, "{\"var_ref\":\"PriorityUserScheduling\"}");
     try expectInt(&env, 7, "{\"var_ref\":\"PriorityTiming\"}");
 }
+
+test "suspended Process survives GC during another's run" {
+    // Regression for the gap closed by this commit: a suspended
+    // Process's bc_pin chain lives on its mmap'd native stack,
+    // outside heap range. Frame slots reachable through
+    // PROCESS_SAVED_FRAME are walked already; what's NOT walked
+    // (pre-fix) is the OUTER frame's bytecode-interp eval-stack
+    // when execution is paused inside a nested send.
+    //
+    // Shape: define a method `gcProbeYield` on Object that calls
+    // `Processor yield` between accessing two heap-pointer
+    // arguments, so when the worker invokes
+    //
+    //   GcLog addLast: (1 gcProbeYield: a with: b)
+    //
+    // the outer bytecode interp parks with eval-stack
+    // [GcLog, 1, a, b] at sp=4 — pre-fix `a` and `b` go stale on
+    // a GC; the post-yield SEND opcode hands a stale `GcLog` to
+    // `addLast:` and either bus-errors or DNUs.
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    // Global log so we can assert from main after both yields.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"GcLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+
+    // Object>>gcProbeYield:with:  Processor yield. ^aOC size + bOC size
+    try env.installMethod(
+        "Object",
+        "gcProbeYield:with:",
+        &.{ "aOC", "bOC" },
+        &.{},
+        \\[
+        \\  {"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}},
+        \\  {"ret":{"send":{"receiver":{"send":{"receiver":{"var_ref":"aOC"},"selector":"size","args":[]}},
+        \\          "selector":"+","args":[{"send":{"receiver":{"var_ref":"bOC"},"selector":"size","args":[]}}]}}}
+        \\]
+    );
+
+    // Worker block:
+    //   | a b |
+    //   a := OC new init. a addLast: 1; addLast: 2; addLast: 3.
+    //   b := OC new init. b addLast: 4; addLast: 5.
+    //   GcLog addLast: (1 gcProbeYield: a with: b).
+    //
+    // At the SEND of gcProbeYield:with: the worker's outer block
+    // frame's eval stack is [GcLog, 1, a, b]; that's what the
+    // chain walker has to pin if the inner method yields.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":["a","b"],"body":[
+        \\  {"assign":{"name":"a","value":{"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}}},
+        \\  {"send":{"receiver":{"var_ref":"a"},"selector":"addLast:","args":[{"literal":{"int":1}}]}},
+        \\  {"send":{"receiver":{"var_ref":"a"},"selector":"addLast:","args":[{"literal":{"int":2}}]}},
+        \\  {"send":{"receiver":{"var_ref":"a"},"selector":"addLast:","args":[{"literal":{"int":3}}]}},
+        \\  {"assign":{"name":"b","value":{"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}}},
+        \\  {"send":{"receiver":{"var_ref":"b"},"selector":"addLast:","args":[{"literal":{"int":4}}]}},
+        \\  {"send":{"receiver":{"var_ref":"b"},"selector":"addLast:","args":[{"literal":{"int":5}}]}},
+        \\  {"send":{"receiver":{"var_ref":"GcLog"},"selector":"addLast:","args":[
+        \\    {"send":{"receiver":{"literal":{"int":1}},"selector":"gcProbeYield:with:","args":[
+        \\      {"var_ref":"a"},{"var_ref":"b"}
+        \\    ]}}
+        \\  ]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    // Worker runs up to its `Processor yield` inside
+    // gcProbeYield:with:, then control returns here.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+
+    // Deterministic GC. Every heap object the suspended worker
+    // holds gets relocated; the bytecode-interp eval-stack on
+    // the worker's mmap stack must be rewritten by the new
+    // chain walker.
+    try env.machine.collectGarbage();
+
+    // Resume the worker; gcProbeYield:with: returns 3 + 2 = 5,
+    // which addLast:'s into GcLog. Pre-fix the post-yield SEND
+    // opcode would dispatch addLast: against a stale GcLog oop.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"GcLog"},"selector":"first","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 5), vm.oop.toInt(got));
+}

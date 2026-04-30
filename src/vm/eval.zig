@@ -168,6 +168,15 @@ pub const Vm = struct {
     // the owning Process oop is GC'd. ArrayList rather than a free
     // list because process churn is low and bookkeeping cheaper.
     process_stacks: std.ArrayList(scheduler_mod.Stack) = .empty,
+    // Every Process oop the Vm is responsible for (main + every
+    // forked one). Each entry's slot address is pushed as a GC
+    // root so the Process oop relocates; collectGarbage iterates
+    // the list to walk every non-active Process's bc_pin chain
+    // (their chains live on the suspended process's mmap stack,
+    // outside heap range, so the standard slot walk doesn't see
+    // them). Terminated processes stay in the list — their
+    // ProcessState.bc_pin is zero, so the chain walk is a no-op.
+    all_processes: std.ArrayList(Oop) = .empty,
 
     // Collect garbage. Roots are every Oop field on the Vm itself plus
     // the Smalltalk anchor in the heap header (the GC handles the
@@ -223,6 +232,25 @@ pub const Vm = struct {
             try self.pushRoot(&n, &p.saved_method_class);
         }
 
+        // Suspended processes own a separate bc_pin chain rooted in
+        // their ProcessState. Active's chain was just walked above.
+        for (self.all_processes.items) |*proc_slot| {
+            try self.pushRoot(&n, proc_slot);
+            const proc = proc_slot.*;
+            if (proc == self.current_process) continue;
+            if (!oop_mod.isHeapPtr(proc)) continue;
+            const state = processStateOf(proc);
+            var spin: ?*BcPin = @ptrFromInt(state.bc_pin);
+            while (spin) |p| : (spin = p.parent) {
+                const sp_susp = p.sp_ptr.*;
+                var i: u32 = 0;
+                while (i < sp_susp) : (i += 1) try self.pushRoot(&n, &p.stack_base[i]);
+                try self.pushRoot(&n, &p.saved_frame);
+                try self.pushRoot(&n, &p.saved_method_frame);
+                try self.pushRoot(&n, &p.saved_method_class);
+            }
+        }
+
         // Root-pin chain: Zig stack locals explicitly pinned by AST
         // eval / prim helpers that can't keep their Oops in heap
         // slots while a child interpretation is in flight.
@@ -263,6 +291,24 @@ pub const Vm = struct {
             try addStackFrameSlots(self, p.saved_frame, heap_lo, heap_hi, &n);
             try addStackFrameSlots(self, p.saved_method_frame, heap_lo, heap_hi, &n);
         }
+
+        // Suspended processes' JIT stack frames also need their
+        // heap-pointer slots walked. saved_frame slots cover the
+        // outer frames; the bc_pin chain saved_frame/method_frame
+        // pin the SEND-time current frames too.
+        for (self.all_processes.items) |proc_slot_v| {
+            const proc = proc_slot_v;
+            if (proc == self.current_process) continue;
+            if (!oop_mod.isHeapPtr(proc)) continue;
+            try addStackFrameSlots(self, object.slot(proc, object.SLOT_PROCESS_SAVED_FRAME), heap_lo, heap_hi, &n);
+            try addStackFrameSlots(self, object.slot(proc, object.SLOT_PROCESS_SAVED_METHOD_FRAME), heap_lo, heap_hi, &n);
+            var ssp: ?*BcPin = @ptrFromInt(processStateOf(proc).bc_pin);
+            while (ssp) |p| : (ssp = p.parent) {
+                try addStackFrameSlots(self, p.saved_frame, heap_lo, heap_hi, &n);
+                try addStackFrameSlots(self, p.saved_method_frame, heap_lo, heap_hi, &n);
+            }
+        }
+
         const fields = self.gc_root_buf;
 
         // GC will rewrite the cached_method slots embedded in the JIT
@@ -316,15 +362,21 @@ pub const Vm = struct {
         object.setSlot(main, object.SLOT_PROCESS_SAVED_FRAME, oop_mod.NIL);
         object.setSlot(main, object.SLOT_PROCESS_SAVED_METHOD_FRAME, oop_mod.NIL);
         object.setSlot(main, object.SLOT_PROCESS_SAVED_METHOD_CLASS, oop_mod.NIL);
+        var main_pin: Oop = main;
+        var slots: [1]?*Oop = .{&main_pin};
+        var pin = RootPin{ .parent = self.root_pin, .slots = &slots, .n = 1 };
+        self.root_pin = &pin;
+        defer self.root_pin = pin.parent;
         const ba = try self.heap.allocBytes(self.globals.byte_array_class, @sizeOf(scheduler_mod.ProcessState));
         // Zero-init the bytes — Context starts clean; the first
         // swap-out into `main` writes its callee-saved state in.
         @memset(object.bytesOf(ba)[0..@sizeOf(scheduler_mod.ProcessState)], 0);
-        object.setSlot(main, object.SLOT_PROCESS_SUSPENDED_CONTEXT, ba);
-        self.current_process = main;
+        object.setSlot(main_pin, object.SLOT_PROCESS_SUSPENDED_CONTEXT, ba);
+        self.current_process = main_pin;
         if (oop_mod.isHeapPtr(self.globals.processor)) {
-            object.setSlot(self.globals.processor, object.SLOT_SCHEDULER_ACTIVE, main);
+            object.setSlot(self.globals.processor, object.SLOT_SCHEDULER_ACTIVE, main_pin);
         }
+        self.all_processes.append(std.heap.page_allocator, main_pin) catch return error.OutOfMemory;
     }
 
     /// Switch from the active process to `target`. Save current
@@ -437,9 +489,18 @@ pub const Vm = struct {
     /// must already have its block / priority / etc. slots filled.
     pub fn primeProcess(self: *Vm, proc: Oop) EvalError!void {
         if (!oop_mod.isHeapPtr(proc)) return error.TypeError;
+        // Pin proc across the allocBytes call so a future GC retry
+        // there can't leave us holding a moved-from oop. Cheap;
+        // matches the discipline elsewhere in the file.
+        var proc_pin: Oop = proc;
+        var slots: [1]?*Oop = .{&proc_pin};
+        var pin = RootPin{ .parent = self.root_pin, .slots = &slots, .n = 1 };
+        self.root_pin = &pin;
+        defer self.root_pin = pin.parent;
+
         const ba = try self.heap.allocBytes(self.globals.byte_array_class, @sizeOf(scheduler_mod.ProcessState));
         @memset(object.bytesOf(ba)[0..@sizeOf(scheduler_mod.ProcessState)], 0);
-        object.setSlot(proc, object.SLOT_PROCESS_SUSPENDED_CONTEXT, ba);
+        object.setSlot(proc_pin, object.SLOT_PROCESS_SUSPENDED_CONTEXT, ba);
         // mmap can fail with platform-specific error codes that
         // aren't part of EvalError; squash them into OutOfMemory
         // so primitives can `try` without enumerating mmap errors.
@@ -449,13 +510,17 @@ pub const Vm = struct {
         // nested send.
         const stack = scheduler_mod.Stack.alloc(2 * 1024 * 1024) catch return error.OutOfMemory;
         self.process_stacks.append(std.heap.page_allocator, stack) catch return error.OutOfMemory;
-        const state = processStateOf(proc);
+        const state = processStateOf(proc_pin);
         state.* = .{
             .ctx = .{},
             .stack_base = @intFromPtr(stack.base.ptr),
             .stack_size = stack.base.len,
         };
         scheduler_mod.prepare(&state.ctx, stack, processEntry, self);
+        // Register only after the ProcessState bytes are zeroed so
+        // a GC walking us during a sibling allocation finds a
+        // safely-empty bc_pin chain rather than uninitialised bytes.
+        self.all_processes.append(std.heap.page_allocator, proc_pin) catch return error.OutOfMemory;
     }
 
     pub fn classOf(self: *const Vm, o: Oop) Oop {
