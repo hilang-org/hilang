@@ -1,0 +1,1071 @@
+const std = @import("std");
+const oop_mod = @import("oop.zig");
+const object = @import("object.zig");
+const print_mod = @import("print.zig");
+const dict = @import("dict.zig");
+const bigint = @import("bigint.zig");
+const eval_mod = @import("eval.zig");
+const Vm = eval_mod.Vm;
+const Oop = oop_mod.Oop;
+
+// Primitives can call back into eval (e.g. BlockClosure>>value), so the
+// error set must include every EvalError variant — alias to keep them
+// in sync automatically.
+pub const PrimError = eval_mod.EvalError;
+
+pub const PrimFn = *const fn (vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop;
+
+// Stable IDs. Methods reference these via their primitive_id slot, so
+// these numbers are part of the on-image ABI — append, never reorder.
+pub const PRIM_INT_ADD: u32 = 1;
+pub const PRIM_INT_SUB: u32 = 2;
+pub const PRIM_INT_MUL: u32 = 3;
+pub const PRIM_INT_LT: u32 = 4;
+pub const PRIM_OBJ_PRINT_NL: u32 = 10;
+pub const PRIM_OBJ_CLASS: u32 = 11;
+pub const PRIM_OBJ_IDENTITY_EQ: u32 = 12;
+pub const PRIM_BLOCK_VALUE: u32 = 20;
+pub const PRIM_BLOCK_VALUE_1: u32 = 21;
+pub const PRIM_BLOCK_VALUE_2: u32 = 22;
+pub const PRIM_BLOCK_VALUE_3: u32 = 23;
+pub const PRIM_BLOCK_VALUE_4: u32 = 24;
+pub const PRIM_BLOCK_WHILE_TRUE: u32 = 25;
+pub const PRIM_BLOCK_WHILE_FALSE: u32 = 26;
+pub const PRIM_TRUE_IF_TRUE: u32 = 30;
+pub const PRIM_TRUE_IF_FALSE: u32 = 31;
+pub const PRIM_TRUE_IF_TRUE_IF_FALSE: u32 = 32;
+pub const PRIM_FALSE_IF_TRUE: u32 = 33;
+pub const PRIM_FALSE_IF_FALSE: u32 = 34;
+pub const PRIM_FALSE_IF_TRUE_IF_FALSE: u32 = 35;
+pub const PRIM_CLASS_NEW: u32 = 40;
+pub const PRIM_OBJECT_SIZE: u32 = 50;
+pub const PRIM_ARRAY_AT: u32 = 51;
+pub const PRIM_ARRAY_AT_PUT: u32 = 52;
+pub const PRIM_ARRAY_NEW_SIZED: u32 = 53;
+pub const PRIM_STRING_CONCAT: u32 = 54;
+pub const PRIM_INT_LE: u32 = 55;
+pub const PRIM_INT_GT: u32 = 56;
+pub const PRIM_INT_GE: u32 = 57;
+pub const PRIM_OBJ_BECOME: u32 = 60;
+pub const PRIM_OBJ_IS_KIND_OF: u32 = 61;
+pub const PRIM_EXC_SIGNAL: u32 = 70;
+pub const PRIM_EXC_MESSAGE_TEXT: u32 = 71;
+pub const PRIM_BLOCK_ON_DO: u32 = 72;
+pub const PRIM_BLOCK_ENSURE: u32 = 73;
+pub const PRIM_OBJ_PERFORM: u32 = 74;
+pub const PRIM_BEHAVIOR_SELECTORS: u32 = 80;
+pub const PRIM_STRING_STARTS_WITH: u32 = 81;
+pub const PRIM_INT_DIV_FLOOR: u32 = 90;
+pub const PRIM_INT_MOD_FLOOR: u32 = 91;
+pub const PRIM_INT_QUO: u32 = 92;
+pub const PRIM_INT_REM: u32 = 93;
+pub const PRIM_STRING_EQUALS: u32 = 94;
+pub const PRIM_INT_AS_STRING: u32 = 95;
+pub const PRIM_BEHAVIOR_NAME: u32 = 96;
+pub const PRIM_STRING_AT: u32 = 97;
+pub const PRIM_STRING_FROM_CHAR_CODE: u32 = 98;
+pub const PRIM_STRING_AS_SYMBOL: u32 = 99;
+pub const PRIM_SYMBOL_AS_STRING: u32 = 100;
+pub const PRIM_FLOAT_ADD: u32 = 110;
+pub const PRIM_FLOAT_SUB: u32 = 111;
+pub const PRIM_FLOAT_MUL: u32 = 112;
+pub const PRIM_FLOAT_DIV: u32 = 113;
+pub const PRIM_FLOAT_LT: u32 = 114;
+pub const PRIM_FLOAT_LE: u32 = 115;
+pub const PRIM_FLOAT_GT: u32 = 116;
+pub const PRIM_FLOAT_GE: u32 = 117;
+pub const PRIM_FLOAT_EQ: u32 = 118;
+pub const PRIM_FLOAT_AS_STRING: u32 = 119;
+pub const PRIM_FLOAT_TRUNCATED: u32 = 120;
+pub const PRIM_INT_AS_FLOAT: u32 = 121;
+pub const PRIM_INT_EQ: u32 = 122;
+pub const PRIM_LARGE_ADD: u32 = 130;
+pub const PRIM_LARGE_SUB: u32 = 131;
+pub const PRIM_LARGE_MUL: u32 = 132;
+pub const PRIM_LARGE_LT: u32 = 133;
+pub const PRIM_LARGE_LE: u32 = 134;
+pub const PRIM_LARGE_GT: u32 = 135;
+pub const PRIM_LARGE_GE: u32 = 136;
+pub const PRIM_LARGE_EQ: u32 = 137;
+pub const PRIM_LARGE_AS_STRING: u32 = 138;
+pub const PRIM_LARGE_AS_FLOAT: u32 = 139;
+pub const PRIM_FLOAT_SQRT: u32 = 140;
+pub const PRIM_FLOAT_SIN: u32 = 141;
+pub const PRIM_FLOAT_COS: u32 = 142;
+pub const PRIM_FLOAT_LN: u32 = 143;
+pub const PRIM_FLOAT_EXP: u32 = 144;
+
+pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
+    return switch (prim_id) {
+        PRIM_INT_ADD => primIntAdd(vm, receiver, args),
+        PRIM_INT_SUB => primIntSub(vm, receiver, args),
+        PRIM_INT_MUL => primIntMul(vm, receiver, args),
+        PRIM_INT_LT => primIntLt(vm, receiver, args),
+        PRIM_OBJ_PRINT_NL => primObjPrintNl(vm, receiver, args),
+        PRIM_OBJ_CLASS => primObjClass(vm, receiver, args),
+        PRIM_OBJ_IDENTITY_EQ => primObjIdentityEq(vm, receiver, args),
+        PRIM_BLOCK_VALUE,
+        PRIM_BLOCK_VALUE_1,
+        PRIM_BLOCK_VALUE_2,
+        PRIM_BLOCK_VALUE_3,
+        PRIM_BLOCK_VALUE_4,
+        => eval_mod.invokeBlock(vm, receiver, args),
+        PRIM_BLOCK_WHILE_TRUE => primBlockWhileTrue(vm, receiver, args),
+        PRIM_BLOCK_WHILE_FALSE => primBlockWhileFalse(vm, receiver, args),
+        PRIM_TRUE_IF_TRUE => primTrueIfTrue(vm, receiver, args),
+        PRIM_TRUE_IF_FALSE => primTrueIfFalse(vm, receiver, args),
+        PRIM_TRUE_IF_TRUE_IF_FALSE => primTrueIfTrueIfFalse(vm, receiver, args),
+        PRIM_FALSE_IF_TRUE => primFalseIfTrue(vm, receiver, args),
+        PRIM_FALSE_IF_FALSE => primFalseIfFalse(vm, receiver, args),
+        PRIM_FALSE_IF_TRUE_IF_FALSE => primFalseIfTrueIfFalse(vm, receiver, args),
+        PRIM_CLASS_NEW => primClassNew(vm, receiver, args),
+        PRIM_OBJECT_SIZE => primObjectSize(vm, receiver, args),
+        PRIM_ARRAY_AT => primArrayAt(vm, receiver, args),
+        PRIM_ARRAY_AT_PUT => primArrayAtPut(vm, receiver, args),
+        PRIM_ARRAY_NEW_SIZED => primArrayNewSized(vm, receiver, args),
+        PRIM_STRING_CONCAT => primStringConcat(vm, receiver, args),
+        PRIM_INT_LE => primIntLe(vm, receiver, args),
+        PRIM_INT_GT => primIntGt(vm, receiver, args),
+        PRIM_INT_GE => primIntGe(vm, receiver, args),
+        PRIM_OBJ_BECOME => primObjBecome(vm, receiver, args),
+        PRIM_OBJ_IS_KIND_OF => primObjIsKindOf(vm, receiver, args),
+        PRIM_EXC_SIGNAL => primExceptionSignal(vm, receiver, args),
+        PRIM_EXC_MESSAGE_TEXT => primExceptionMessageText(vm, receiver, args),
+        PRIM_BLOCK_ON_DO => primBlockOnDo(vm, receiver, args),
+        PRIM_BLOCK_ENSURE => primBlockEnsure(vm, receiver, args),
+        PRIM_OBJ_PERFORM => primObjPerform(vm, receiver, args),
+        PRIM_BEHAVIOR_SELECTORS => primBehaviorSelectors(vm, receiver, args),
+        PRIM_STRING_STARTS_WITH => primStringStartsWith(vm, receiver, args),
+        PRIM_INT_DIV_FLOOR => primIntDivFloor(vm, receiver, args),
+        PRIM_INT_MOD_FLOOR => primIntModFloor(vm, receiver, args),
+        PRIM_INT_QUO => primIntQuo(vm, receiver, args),
+        PRIM_INT_REM => primIntRem(vm, receiver, args),
+        PRIM_STRING_EQUALS => primStringEquals(vm, receiver, args),
+        PRIM_INT_AS_STRING => primIntAsString(vm, receiver, args),
+        PRIM_BEHAVIOR_NAME => primBehaviorName(vm, receiver, args),
+        PRIM_STRING_AT => primStringAt(vm, receiver, args),
+        PRIM_STRING_FROM_CHAR_CODE => primStringFromCharCode(vm, receiver, args),
+        PRIM_STRING_AS_SYMBOL => primStringAsSymbol(vm, receiver, args),
+        PRIM_SYMBOL_AS_STRING => primSymbolAsString(vm, receiver, args),
+        PRIM_FLOAT_ADD => primFloatAdd(vm, receiver, args),
+        PRIM_FLOAT_SUB => primFloatSub(vm, receiver, args),
+        PRIM_FLOAT_MUL => primFloatMul(vm, receiver, args),
+        PRIM_FLOAT_DIV => primFloatDiv(vm, receiver, args),
+        PRIM_FLOAT_LT => primFloatLt(vm, receiver, args),
+        PRIM_FLOAT_LE => primFloatLe(vm, receiver, args),
+        PRIM_FLOAT_GT => primFloatGt(vm, receiver, args),
+        PRIM_FLOAT_GE => primFloatGe(vm, receiver, args),
+        PRIM_FLOAT_EQ => primFloatEq(vm, receiver, args),
+        PRIM_FLOAT_AS_STRING => primFloatAsString(vm, receiver, args),
+        PRIM_FLOAT_TRUNCATED => primFloatTruncated(vm, receiver, args),
+        PRIM_INT_AS_FLOAT => primIntAsFloat(vm, receiver, args),
+        PRIM_INT_EQ => primIntEq(vm, receiver, args),
+        PRIM_LARGE_ADD => primLargeAdd(vm, receiver, args),
+        PRIM_LARGE_SUB => primLargeSub(vm, receiver, args),
+        PRIM_LARGE_MUL => primLargeMul(vm, receiver, args),
+        PRIM_LARGE_LT => primLargeCmp(vm, receiver, args, .lt),
+        PRIM_LARGE_LE => primLargeCmp(vm, receiver, args, .le),
+        PRIM_LARGE_GT => primLargeCmp(vm, receiver, args, .gt),
+        PRIM_LARGE_GE => primLargeCmp(vm, receiver, args, .ge),
+        PRIM_LARGE_EQ => primLargeCmp(vm, receiver, args, .eq),
+        PRIM_LARGE_AS_STRING => primLargeAsString(vm, receiver, args),
+        PRIM_LARGE_AS_FLOAT => primLargeAsFloat(vm, receiver, args),
+        PRIM_FLOAT_SQRT => primFloatMath(vm, receiver, args, .sqrt),
+        PRIM_FLOAT_SIN => primFloatMath(vm, receiver, args, .sin),
+        PRIM_FLOAT_COS => primFloatMath(vm, receiver, args, .cos),
+        PRIM_FLOAT_LN => primFloatMath(vm, receiver, args, .ln),
+        PRIM_FLOAT_EXP => primFloatMath(vm, receiver, args, .exp),
+        else => error.UnknownPrimitive,
+    };
+}
+
+// Number coercion helper. Returns f64 if the Oop is a tagged Int or
+// tagged Float; otherwise null. Used by mixed-type arithmetic so that
+// `1 + 2.5` and `2.5 + 1` both promote to Float (Phase A.2).
+inline fn asF64(o: Oop) ?f64 {
+    if (oop_mod.isInt(o)) return @floatFromInt(oop_mod.toInt(o));
+    if (oop_mod.isFloat(o)) return oop_mod.toF64(o);
+    return null;
+}
+
+// Smalltalk-side double dispatch fallbacks. When an Int primitive is
+// called with an arg of a type the primitive doesn't recognize (e.g.
+// Fraction), defer to the arg's own implementation. Commutative ops
+// just swap; non-commutative ones rewrite via negation or inversion.
+//
+// Pin every Oop local across each sendSym — including the inline
+// args slice's element. A bare `&.{receiver}` is a stack temporary
+// not in any GC-walked region, so an inner safe-point GC would leave
+// args[0] pointing at moved-from memory.
+fn fallbackCommutative(vm: *Vm, receiver: Oop, arg: Oop, sel: []const u8) PrimError!Oop {
+    var arg_pin: Oop = arg;
+    var sym_pin: Oop = oop_mod.NIL;
+    var args_buf: [1]Oop = .{receiver};
+    var slot_ptrs: [3]?*Oop = .{ &arg_pin, &sym_pin, &args_buf[0] };
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 3 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    sym_pin = try dict.newSymbol(vm.heap, &vm.globals, sel);
+    return vm.sendSym(arg_pin, sym_pin, &args_buf);
+}
+
+fn fallbackSub(vm: *Vm, receiver: Oop, arg: Oop) PrimError!Oop {
+    // a - b  ==  (b negated) + a
+    var arg_pin: Oop = arg;
+    var neg_sym_pin: Oop = oop_mod.NIL;
+    var neg_pin: Oop = oop_mod.NIL;
+    var args_buf: [1]Oop = .{receiver};
+    var slot_ptrs: [4]?*Oop = .{ &arg_pin, &neg_sym_pin, &neg_pin, &args_buf[0] };
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 4 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    neg_sym_pin = try dict.newSymbol(vm.heap, &vm.globals, "negated");
+    neg_pin = try vm.sendSym(arg_pin, neg_sym_pin, &.{});
+    return vm.sendSym(neg_pin, vm.globals.sym_plus, &args_buf);
+}
+
+// a < b  ==  b > a, etc. The inverse map for comparisons.
+fn fallbackCmp(vm: *Vm, receiver: Oop, arg: Oop, swapped_sel: Oop) PrimError!Oop {
+    var arg_pin: Oop = arg;
+    var sel_pin: Oop = swapped_sel;
+    var args_buf: [1]Oop = .{receiver};
+    var slot_ptrs: [3]?*Oop = .{ &arg_pin, &sel_pin, &args_buf[0] };
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 3 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    return vm.sendSym(arg_pin, sel_pin, &args_buf);
+}
+
+fn primIntAdd(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    if (oop_mod.isInt(args[0])) {
+        const a = oop_mod.toInt(receiver);
+        const b = oop_mod.toInt(args[0]);
+        const sum = a +% b;
+        if (((a ^ sum) & (b ^ sum)) >= 0 and oop_mod.fitsSmallInt(sum)) return oop_mod.fromInt(sum);
+        return bigint.add(vm.heap, &vm.globals, receiver, args[0]);
+    }
+    if (oop_mod.isFloat(args[0])) return oop_mod.fromF64(@as(f64, @floatFromInt(oop_mod.toInt(receiver))) + oop_mod.toF64(args[0]));
+    if (bigint.isLarge(&vm.globals, args[0])) return bigint.add(vm.heap, &vm.globals, receiver, args[0]);
+    return fallbackCommutative(vm, receiver, args[0], "+");
+}
+
+fn primIntSub(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    if (oop_mod.isInt(args[0])) {
+        const a = oop_mod.toInt(receiver);
+        const b = oop_mod.toInt(args[0]);
+        const diff = a -% b;
+        if (((a ^ b) & (a ^ diff)) >= 0 and oop_mod.fitsSmallInt(diff)) return oop_mod.fromInt(diff);
+        return bigint.sub(vm.heap, &vm.globals, receiver, args[0]);
+    }
+    if (oop_mod.isFloat(args[0])) return oop_mod.fromF64(@as(f64, @floatFromInt(oop_mod.toInt(receiver))) - oop_mod.toF64(args[0]));
+    if (bigint.isLarge(&vm.globals, args[0])) return bigint.sub(vm.heap, &vm.globals, receiver, args[0]);
+    return fallbackSub(vm, receiver, args[0]);
+}
+
+fn primIntMul(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    if (oop_mod.isInt(args[0])) {
+        const a = oop_mod.toInt(receiver);
+        const b = oop_mod.toInt(args[0]);
+        const m = @mulWithOverflow(a, b);
+        if (m[1] == 0 and oop_mod.fitsSmallInt(m[0])) return oop_mod.fromInt(m[0]);
+        return bigint.mul(vm.heap, &vm.globals, receiver, args[0]);
+    }
+    if (oop_mod.isFloat(args[0])) return oop_mod.fromF64(@as(f64, @floatFromInt(oop_mod.toInt(receiver))) * oop_mod.toF64(args[0]));
+    if (bigint.isLarge(&vm.globals, args[0])) return bigint.mul(vm.heap, &vm.globals, receiver, args[0]);
+    return fallbackCommutative(vm, receiver, args[0], "*");
+}
+
+fn primIntLt(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    if (oop_mod.isInt(args[0])) return oop_mod.fromBool(oop_mod.toInt(receiver) < oop_mod.toInt(args[0]));
+    if (oop_mod.isFloat(args[0])) return oop_mod.fromBool(@as(f64, @floatFromInt(oop_mod.toInt(receiver))) < oop_mod.toF64(args[0]));
+    if (bigint.isLarge(&vm.globals, args[0])) {
+        const o = bigint.cmp(&vm.globals, receiver, args[0]) orelse return error.TypeError;
+        return oop_mod.fromBool(o == .lt);
+    }
+    return fallbackCmp(vm, receiver, args[0], vm.globals.sym_gt);
+}
+
+fn primIntEq(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    if (oop_mod.isInt(args[0])) return oop_mod.fromBool(receiver == args[0]);
+    if (oop_mod.isFloat(args[0])) return oop_mod.fromBool(@as(f64, @floatFromInt(oop_mod.toInt(receiver))) == oop_mod.toF64(args[0]));
+    if (bigint.isLarge(&vm.globals, args[0])) {
+        // A canonical Large is never == a SmallInt, by construction.
+        return oop_mod.fromBool(false);
+    }
+    return fallbackCommutative(vm, receiver, args[0], "=");
+}
+
+fn primObjPrintNl(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (vm.output) |sink| {
+        // Dispatch through Smalltalk-side printString (defined in stdlib).
+        // Falls back to Zig-side rendering if it fails (e.g., before
+        // stdlib loads).
+        const result = vm.sendSym(receiver, vm.globals.sym_printString, &.{}) catch {
+            var arena = std.heap.ArenaAllocator.init(sink.allocator);
+            defer arena.deinit();
+            const s = print_mod.printString(arena.allocator(), vm, receiver) catch return error.OutOfMemory;
+            sink.buffer.appendSlice(sink.allocator, s) catch return error.OutOfMemory;
+            sink.buffer.append(sink.allocator, '\n') catch return error.OutOfMemory;
+            return receiver;
+        };
+        if (oop_mod.isHeapPtr(result)) {
+            const hdr = object.headerOf(result);
+            if ((hdr.flags & object.FLAG_BYTES) != 0) {
+                const bytes = object.bytesOf(result)[0..hdr.size];
+                sink.buffer.appendSlice(sink.allocator, bytes) catch return error.OutOfMemory;
+            }
+        }
+        sink.buffer.append(sink.allocator, '\n') catch return error.OutOfMemory;
+    }
+    return receiver;
+}
+
+fn primObjClass(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    return vm.classOf(receiver);
+}
+
+fn primObjIdentityEq(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    return oop_mod.fromBool(receiver == args[0]);
+}
+
+// Conditional primitives. Bodies are trivial because the conditional
+// logic falls out of method dispatch — True#ifTrue: invokes its block,
+// False#ifTrue: just returns nil. Both arms are sent `value`, so any
+// object responding to `value` works as a "block" (polymorphism that
+// matches Smalltalk-80).
+fn primTrueIfTrue(vm: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    return vm.sendSym(args[0], vm.globals.sym_value, &.{});
+}
+
+fn primTrueIfFalse(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    return oop_mod.NIL;
+}
+
+fn primTrueIfTrueIfFalse(vm: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 2) return error.ArityMismatch;
+    return vm.sendSym(args[0], vm.globals.sym_value, &.{});
+}
+
+fn primFalseIfTrue(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    return oop_mod.NIL;
+}
+
+fn primFalseIfFalse(vm: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    return vm.sendSym(args[0], vm.globals.sym_value, &.{});
+}
+
+fn primFalseIfTrueIfFalse(vm: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 2) return error.ArityMismatch;
+    return vm.sendSym(args[1], vm.globals.sym_value, &.{});
+}
+
+// Loop primitives. Receiver is a block tested each iteration; the body
+// is the argument block. Returns nil (Smalltalk convention).
+//
+// `recv_pin` and `body_pin` are stack-local Oop slots pinned through
+// the GC root-pin chain. Without that pinning, a GC fired by either
+// `vm.sendSym` call would leave the Zig parameter `receiver` and the
+// args-slice contents stale, and the next iteration would dispatch
+// against a moved-from address.
+fn primBlockWhileTrue(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    var recv_pin: Oop = receiver;
+    var body_pin: Oop = args[0];
+    var slot_ptrs: [2]?*Oop = .{ &recv_pin, &body_pin };
+    var pin = eval_mod.RootPin{
+        .parent = vm.root_pin,
+        .slots = &slot_ptrs,
+        .n = 2,
+    };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    while (true) {
+        const cond = try vm.sendSym(recv_pin, vm.globals.sym_value, &.{});
+        if (cond != oop_mod.TRUE) break;
+        _ = try vm.sendSym(body_pin, vm.globals.sym_value, &.{});
+    }
+    return oop_mod.NIL;
+}
+
+// Object>>size: number of slots (or bytes for byte objects). 0 for
+// SmallIntegers and sentinels.
+fn primObjectSize(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return oop_mod.fromInt(0);
+    return oop_mod.fromInt(@intCast(object.headerOf(receiver).size));
+}
+
+// Array>>at: 1-based index lookup over slot array. Bounds-checked.
+fn primArrayAt(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const i = oop_mod.toInt(args[0]);
+    if (i < 1) return error.PrimitiveFailed;
+    const idx: u32 = @intCast(i - 1);
+    if (idx >= object.headerOf(receiver).size) return error.PrimitiveFailed;
+    return object.slot(receiver, idx);
+}
+
+// Array>>at:put: 1-based index store. Returns the stored value.
+fn primArrayAtPut(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 2) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const i = oop_mod.toInt(args[0]);
+    if (i < 1) return error.PrimitiveFailed;
+    const idx: u32 = @intCast(i - 1);
+    if (idx >= object.headerOf(receiver).size) return error.PrimitiveFailed;
+    object.setSlot(receiver, idx, args[1]);
+    return args[1];
+}
+
+// Array class>>new: allocate a slot-array of `arg` slots, each NIL.
+// Receiver is expected to be Array (or any class with array-like
+// instances) — this primitive is installed on Array's metaclass only.
+fn primArrayNewSized(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const n = oop_mod.toInt(args[0]);
+    if (n < 0) return error.PrimitiveFailed;
+    return vm.heap.allocSlots(receiver, @intCast(n)) catch error.OutOfMemory;
+}
+
+// String>>, : byte concatenation. Returns a new String containing the
+// receiver's bytes followed by the argument's bytes.
+fn primStringConcat(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver) or !oop_mod.isHeapPtr(args[0])) return error.TypeError;
+    const ah = object.headerOf(receiver);
+    const bh = object.headerOf(args[0]);
+    if ((ah.flags & object.FLAG_BYTES) == 0 or (bh.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const total = ah.size + bh.size;
+    const result = vm.heap.allocBytes(vm.globals.string_class, total) catch return error.OutOfMemory;
+    const dst = object.bytesOf(result);
+    @memcpy(dst[0..ah.size], object.bytesOf(receiver)[0..ah.size]);
+    @memcpy(dst[ah.size .. ah.size + bh.size], object.bytesOf(args[0])[0..bh.size]);
+    return result;
+}
+
+fn primIntLe(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    if (oop_mod.isInt(args[0])) return oop_mod.fromBool(oop_mod.toInt(receiver) <= oop_mod.toInt(args[0]));
+    if (oop_mod.isFloat(args[0])) return oop_mod.fromBool(@as(f64, @floatFromInt(oop_mod.toInt(receiver))) <= oop_mod.toF64(args[0]));
+    if (bigint.isLarge(&vm.globals, args[0])) {
+        const o = bigint.cmp(&vm.globals, receiver, args[0]) orelse return error.TypeError;
+        return oop_mod.fromBool(o != .gt);
+    }
+    return fallbackCmp(vm, receiver, args[0], vm.globals.sym_ge);
+}
+
+fn primIntGt(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    if (oop_mod.isInt(args[0])) return oop_mod.fromBool(oop_mod.toInt(receiver) > oop_mod.toInt(args[0]));
+    if (oop_mod.isFloat(args[0])) return oop_mod.fromBool(@as(f64, @floatFromInt(oop_mod.toInt(receiver))) > oop_mod.toF64(args[0]));
+    if (bigint.isLarge(&vm.globals, args[0])) {
+        const o = bigint.cmp(&vm.globals, receiver, args[0]) orelse return error.TypeError;
+        return oop_mod.fromBool(o == .gt);
+    }
+    return fallbackCmp(vm, receiver, args[0], vm.globals.sym_lt);
+}
+
+fn primIntGe(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    if (oop_mod.isInt(args[0])) return oop_mod.fromBool(oop_mod.toInt(receiver) >= oop_mod.toInt(args[0]));
+    if (oop_mod.isFloat(args[0])) return oop_mod.fromBool(@as(f64, @floatFromInt(oop_mod.toInt(receiver))) >= oop_mod.toF64(args[0]));
+    if (bigint.isLarge(&vm.globals, args[0])) {
+        const o = bigint.cmp(&vm.globals, receiver, args[0]) orelse return error.TypeError;
+        return oop_mod.fromBool(o != .lt);
+    }
+    return fallbackCmp(vm, receiver, args[0], vm.globals.sym_le);
+}
+
+// Object>>become: Swap the identities of two objects across the entire
+// image. After this call, every reference to `receiver` becomes a
+// reference to `other` and vice versa. Walks the heap; O(used).
+// Receiver and arg must both be heap pointers.
+fn primObjBecome(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    const other = args[0];
+    if (!oop_mod.isHeapPtr(receiver) or !oop_mod.isHeapPtr(other)) return error.TypeError;
+    if (receiver == other) return receiver;
+
+    const start: u64 = @intFromPtr(vm.heap.activeBase());
+    const end: u64 = start + vm.heap.used;
+    var addr: u64 = start;
+    while (addr < end) {
+        const hdr: *object.Header = @ptrFromInt(addr);
+
+        if (hdr.class == receiver) hdr.class = other else if (hdr.class == other) hdr.class = receiver;
+
+        const is_bytes = (hdr.flags & object.FLAG_BYTES) != 0;
+        if (!is_bytes) {
+            const slots: [*]Oop = @ptrFromInt(addr + @sizeOf(object.Header));
+            var i: u32 = 0;
+            while (i < hdr.size) : (i += 1) {
+                if (slots[i] == receiver) {
+                    slots[i] = other;
+                } else if (slots[i] == other) {
+                    slots[i] = receiver;
+                }
+            }
+        }
+
+        const payload_bytes = if (is_bytes) hdr.size else hdr.size * @sizeOf(Oop);
+        const total = @sizeOf(object.Header) + payload_bytes;
+        addr += std.mem.alignForward(usize, total, 8);
+    }
+
+    // Also swap in the image header anchor + Vm root fields, since
+    // those reference heap objects by Oop too.
+    const ih = vm.heap.imageHeader();
+    if (ih.smalltalk == receiver) ih.smalltalk = other else if (ih.smalltalk == other) ih.smalltalk = receiver;
+    swapInPlace(&vm.current_frame, receiver, other);
+    swapInPlace(&vm.current_method_frame, receiver, other);
+    swapInPlace(&vm.current_method_class, receiver, other);
+    swapInPlace(&vm.return_value, receiver, other);
+    swapInPlace(&vm.return_target, receiver, other);
+
+    // Globals struct fields too.
+    const g = &vm.globals;
+    inline for (.{
+        &g.object_class,           &g.behavior_class,           &g.class_description_class,
+        &g.class_class,            &g.metaclass_class,          &g.undefined_class,
+        &g.boolean_class,          &g.true_class,               &g.false_class,
+        &g.smallinteger_class,     &g.small_float_class,        &g.byte_array_class,         &g.string_class,
+        &g.symbol_class,           &g.array_class,              &g.dictionary_class,
+        &g.compiled_method_class,  &g.frame_class,              &g.block_closure_class,
+        &g.literal_node_class,     &g.var_ref_node_class,       &g.assign_node_class,
+        &g.send_node_class,        &g.super_send_node_class,    &g.block_node_class,
+        &g.seq_node_class,         &g.ret_node_class,           &g.exception_class,
+        &g.smalltalk,              &g.symbol_table,
+        &g.sym_nil,                &g.sym_true,                 &g.sym_false,
+        &g.sym_smalltalk,          &g.sym_thisContext,          &g.sym_self,
+        &g.sym_value,              &g.sym_value_colon,
+        &g.sym_plus,               &g.sym_minus,                &g.sym_times,
+        &g.sym_lt,                 &g.sym_le,                   &g.sym_gt,
+        &g.sym_ge,                 &g.sym_printString,
+    }) |p| swapInPlace(p, receiver, other);
+
+    swapInPlace(&vm.signaled_exception, receiver, other);
+
+    return other;
+}
+
+fn swapInPlace(p: *Oop, a: Oop, b: Oop) void {
+    if (p.* == a) p.* = b else if (p.* == b) p.* = a;
+}
+
+// Object>>isKindOf: walks the receiver's class chain looking for the
+// argument class. Returns true if the receiver is an instance of the
+// class or any of its subclasses.
+fn primObjIsKindOf(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    return oop_mod.fromBool(isKindOfImpl(vm, receiver, args[0]));
+}
+
+fn isKindOfImpl(vm: *const Vm, instance: Oop, target: Oop) bool {
+    var cls = vm.classOf(instance);
+    while (oop_mod.isHeapPtr(cls)) {
+        if (cls == target) return true;
+        cls = object.slot(cls, object.SLOT_SUPERCLASS);
+    }
+    return false;
+}
+
+// Exception>>signal: receiver is an Exception instance; arg is the
+// messageText. Stores the message and raises UserSignal carrying the
+// receiver in vm.signaled_exception.
+fn primExceptionSignal(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    object.setSlot(receiver, object.SLOT_EXCEPTION_MESSAGE, args[0]);
+    vm.signaled_exception = receiver;
+    return error.UserSignal;
+}
+
+fn primExceptionMessageText(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    return object.slot(receiver, object.SLOT_EXCEPTION_MESSAGE);
+}
+
+// Block>>on:do: invokes the receiver. If a UserSignal escapes whose
+// exception isKindOf args[0], invokes args[1] with the exception as
+// argument and returns its result. Otherwise rethrows. Non-signal
+// errors propagate unchanged.
+fn primBlockOnDo(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 2) return error.ArityMismatch;
+    var recv_pin: Oop = receiver;
+    var exc_class_pin: Oop = args[0];
+    var handler_pin: Oop = args[1];
+    var slot_ptrs: [3]?*Oop = .{ &recv_pin, &exc_class_pin, &handler_pin };
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 3 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    return vm.sendSym(recv_pin, vm.globals.sym_value, &.{}) catch |e| {
+        if (e == error.UserSignal) {
+            const exc = vm.signaled_exception;
+            if (isKindOfImpl(vm, exc, exc_class_pin)) {
+                vm.signaled_exception = oop_mod.NIL;
+                // Pin args slice element across the handler send.
+                var arg_buf: [1]Oop = .{exc};
+                var arg_pin_slots: [1]?*Oop = .{&arg_buf[0]};
+                var arg_pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &arg_pin_slots, .n = 1 };
+                vm.root_pin = &arg_pin;
+                defer vm.root_pin = arg_pin.parent;
+                return vm.sendSym(handler_pin, vm.globals.sym_value_colon, &arg_buf);
+            }
+        }
+        return e;
+    };
+}
+
+// Behavior>>selectors returns an Array of the receiver's own method
+// selectors (not inherited). Walks the receiver's methodDict; returns
+// an empty Array when the dict is nil. Installed on Class so any class
+// receiver (instance of a Metaclass that inherits Class) responds.
+fn primBehaviorSelectors(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const md = object.slot(receiver, object.SLOT_METHOD_DICT);
+    if (oop_mod.isNil(md)) {
+        return vm.heap.allocSlots(vm.globals.array_class, 0) catch error.OutOfMemory;
+    }
+    const keys = object.slot(md, object.SLOT_DICT_KEYS);
+    const count: u32 = @intCast(oop_mod.toInt(object.slot(md, object.SLOT_DICT_COUNT)));
+    const result = vm.heap.allocSlots(vm.globals.array_class, count) catch return error.OutOfMemory;
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        object.setSlot(result, i, object.slot(keys, i));
+    }
+    return result;
+}
+
+// String>>startsWith: returns true if the receiver's bytes begin with
+// the argument's bytes. Symbols qualify since they share the byte
+// layout (FLAG_BYTES).
+// Integer>>// floor division (Smalltalk semantics: rounds toward
+// negative infinity). Division by zero is a primitive failure.
+fn primIntDivFloor(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver) or !oop_mod.isInt(args[0])) return error.TypeError;
+    const b = oop_mod.toInt(args[0]);
+    if (b == 0) return error.PrimitiveFailed;
+    return oop_mod.fromInt(@divFloor(oop_mod.toInt(receiver), b));
+}
+
+// Integer>>\\ floor modulo. Always returns same sign as divisor.
+fn primIntModFloor(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver) or !oop_mod.isInt(args[0])) return error.TypeError;
+    const b = oop_mod.toInt(args[0]);
+    if (b == 0) return error.PrimitiveFailed;
+    return oop_mod.fromInt(@mod(oop_mod.toInt(receiver), b));
+}
+
+// Integer>>quo: truncated division (rounds toward zero).
+fn primIntQuo(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver) or !oop_mod.isInt(args[0])) return error.TypeError;
+    const b = oop_mod.toInt(args[0]);
+    if (b == 0) return error.PrimitiveFailed;
+    return oop_mod.fromInt(@divTrunc(oop_mod.toInt(receiver), b));
+}
+
+// Integer>>rem: truncated remainder. Same sign as receiver.
+fn primIntRem(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver) or !oop_mod.isInt(args[0])) return error.TypeError;
+    const b = oop_mod.toInt(args[0]);
+    if (b == 0) return error.PrimitiveFailed;
+    return oop_mod.fromInt(@rem(oop_mod.toInt(receiver), b));
+}
+
+// SmallFloat arithmetic. Receiver must be a tagged float; the arg may
+// be a tagged int (coerced to float) or another tagged float (Phase A.2).
+fn primFloatAdd(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return error.TypeError;
+    return oop_mod.fromF64(oop_mod.toF64(receiver) + b);
+}
+
+fn primFloatSub(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return error.TypeError;
+    return oop_mod.fromF64(oop_mod.toF64(receiver) - b);
+}
+
+fn primFloatMul(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return error.TypeError;
+    return oop_mod.fromF64(oop_mod.toF64(receiver) * b);
+}
+
+fn primFloatDiv(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return error.TypeError;
+    if (b == 0.0) return error.PrimitiveFailed;
+    return oop_mod.fromF64(oop_mod.toF64(receiver) / b);
+}
+
+fn primFloatLt(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return error.TypeError;
+    return oop_mod.fromBool(oop_mod.toF64(receiver) < b);
+}
+
+fn primFloatLe(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return error.TypeError;
+    return oop_mod.fromBool(oop_mod.toF64(receiver) <= b);
+}
+
+fn primFloatGt(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return error.TypeError;
+    return oop_mod.fromBool(oop_mod.toF64(receiver) > b);
+}
+
+fn primFloatGe(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return error.TypeError;
+    return oop_mod.fromBool(oop_mod.toF64(receiver) >= b);
+}
+
+fn primFloatEq(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const b = asF64(args[0]) orelse return oop_mod.fromBool(false);
+    return oop_mod.fromBool(oop_mod.toF64(receiver) == b);
+}
+
+// SmallFloat>>asString — produce a fresh String like "3.14" or "1.0e10".
+fn primFloatAsString(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    var buf: [64]u8 = undefined;
+    const f = oop_mod.toF64(receiver);
+    const s = std.fmt.bufPrint(&buf, "{d}", .{f}) catch return error.PrimitiveFailed;
+    const result = vm.heap.allocBytes(vm.globals.string_class, @intCast(s.len)) catch return error.OutOfMemory;
+    @memcpy(object.bytesOf(result)[0..s.len], s);
+    return result;
+}
+
+// SmallFloat>>truncated — round toward zero to a SmallInteger.
+fn primFloatTruncated(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const f = oop_mod.toF64(receiver);
+    const min_i63: f64 = -4611686018427387904.0; // -(2^62)
+    const max_i63: f64 = 4611686018427387903.0; // 2^62 - 1
+    if (f < min_i63 or f > max_i63) return error.PrimitiveFailed;
+    return oop_mod.fromInt(@intFromFloat(@trunc(f)));
+}
+
+// SmallInteger>>asFloat — convert to tagged SmallFloat.
+fn primIntAsFloat(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    const i = oop_mod.toInt(receiver);
+    return oop_mod.fromF64(@floatFromInt(i));
+}
+
+// String>>at: i — return the SmallInteger char code at 1-based index.
+fn primStringAt(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const r_hdr = object.headerOf(receiver);
+    if ((r_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const i = oop_mod.toInt(args[0]);
+    if (i < 1) return error.PrimitiveFailed;
+    const idx: u32 = @intCast(i - 1);
+    if (idx >= r_hdr.size) return error.PrimitiveFailed;
+    return oop_mod.fromInt(@intCast(object.bytesOf(receiver)[idx]));
+}
+
+// String class>>fromCharCode: code — produce a 1-byte String with the
+// given char code. Char-style operations build up via WriteStream +
+// nextPutAll: with a fromCharCode: result.
+fn primStringFromCharCode(vm: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isInt(args[0])) return error.TypeError;
+    const code = oop_mod.toInt(args[0]);
+    if (code < 0 or code > 255) return error.PrimitiveFailed;
+    const result = vm.heap.allocBytes(vm.globals.string_class, 1) catch return error.OutOfMemory;
+    object.bytesOf(result)[0] = @intCast(code);
+    return result;
+}
+
+// String>>asSymbol — return the interned Symbol for these bytes.
+fn primStringAsSymbol(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const hdr = object.headerOf(receiver);
+    if ((hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const bytes = object.bytesOf(receiver)[0..hdr.size];
+    return dict.newSymbol(vm.heap, &vm.globals, bytes) catch error.OutOfMemory;
+}
+
+// Symbol>>asString — allocate a fresh String with the same bytes.
+// Each call returns a new object — Symbols are unique, Strings aren't.
+fn primSymbolAsString(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const hdr = object.headerOf(receiver);
+    if ((hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const result = vm.heap.allocBytes(vm.globals.string_class, hdr.size) catch return error.OutOfMemory;
+    @memcpy(object.bytesOf(result)[0..hdr.size], object.bytesOf(receiver)[0..hdr.size]);
+    return result;
+}
+
+// SmallInteger>>asString — decimal digit conversion. The Smalltalk-side
+// printOn: protocol calls this and writes the bytes through.
+fn primIntAsString(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isInt(receiver)) return error.TypeError;
+    var buf: [32]u8 = undefined;
+    const n = oop_mod.toInt(receiver);
+    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return error.PrimitiveFailed;
+    const result = vm.heap.allocBytes(vm.globals.string_class, @intCast(s.len)) catch return error.OutOfMemory;
+    @memcpy(object.bytesOf(result)[0..s.len], s);
+    return result;
+}
+
+// Behavior>>name — returns the name slot of a class (a Symbol). For
+// metaclass-instance receivers the slot holds thisClass instead, so
+// the result is the regular class — caller's responsibility to know
+// which.
+fn primBehaviorName(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    if (object.headerOf(receiver).size <= object.SLOT_NAME) return oop_mod.NIL;
+    return object.slot(receiver, object.SLOT_NAME);
+}
+
+// String>>= byte-equality. Override of Object>>= (identity) for value
+// semantics on Strings and Symbols. NIL/non-byte arg → false.
+fn primStringEquals(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    if (!oop_mod.isHeapPtr(args[0])) return oop_mod.FALSE;
+    const r_hdr = object.headerOf(receiver);
+    const a_hdr = object.headerOf(args[0]);
+    if ((r_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    if ((a_hdr.flags & object.FLAG_BYTES) == 0) return oop_mod.FALSE;
+    if (r_hdr.size != a_hdr.size) return oop_mod.FALSE;
+    const r_bytes = object.bytesOf(receiver)[0..r_hdr.size];
+    const a_bytes = object.bytesOf(args[0])[0..a_hdr.size];
+    return oop_mod.fromBool(std.mem.eql(u8, r_bytes, a_bytes));
+}
+
+fn primStringStartsWith(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver) or !oop_mod.isHeapPtr(args[0])) return error.TypeError;
+    const r_hdr = object.headerOf(receiver);
+    const p_hdr = object.headerOf(args[0]);
+    if ((r_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    if ((p_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    if (p_hdr.size > r_hdr.size) return oop_mod.FALSE;
+    const r_bytes = object.bytesOf(receiver)[0..r_hdr.size];
+    const p_bytes = object.bytesOf(args[0])[0..p_hdr.size];
+    return oop_mod.fromBool(std.mem.startsWith(u8, r_bytes, p_bytes));
+}
+
+// Object>>perform: invokes selector (a Symbol or String) on the
+// receiver with no arguments. Used by reflective callers like the
+// SUnit test runner to dispatch a test method by name.
+fn primObjPerform(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    var recv_pin: Oop = receiver;
+    var a_pin: Oop = args[0];
+    var sel_sym_pin: Oop = oop_mod.NIL;
+    var slot_ptrs: [3]?*Oop = .{ &recv_pin, &a_pin, &sel_sym_pin };
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 3 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    if (!oop_mod.isHeapPtr(a_pin)) return error.TypeError;
+    const hdr = object.headerOf(a_pin);
+    if ((hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
+    const bytes = object.bytesOf(a_pin)[0..hdr.size];
+    sel_sym_pin = dict.newSymbol(vm.heap, &vm.globals, bytes) catch return error.OutOfMemory;
+    return vm.sendSym(recv_pin, sel_sym_pin, &.{});
+}
+
+// Block>>ensure: runs the ensure block in both the normal and the
+// exceptional path. If the receiver throws, the ensure block runs and
+// the original error is rethrown.
+fn primBlockEnsure(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    var recv_pin: Oop = receiver;
+    var ensure_pin: Oop = args[0];
+    var result_pin: Oop = oop_mod.NIL;
+    var slot_ptrs: [3]?*Oop = .{ &recv_pin, &ensure_pin, &result_pin };
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 3 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    result_pin = vm.sendSym(recv_pin, vm.globals.sym_value, &.{}) catch |e| {
+        // Best-effort run of the ensure block; swallow its own error
+        // so the original propagates.
+        _ = vm.sendSym(ensure_pin, vm.globals.sym_value, &.{}) catch {};
+        return e;
+    };
+    _ = try vm.sendSym(ensure_pin, vm.globals.sym_value, &.{});
+    return result_pin;
+}
+
+// Class>>new: allocate a fresh instance of `receiver` (a class), with
+// slot count equal to the class's total ivar count up the chain. All
+// slots are NIL. This is the canonical Smalltalk constructor.
+fn primClassNew(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const class_mod = @import("class.zig");
+    const n = class_mod.countIvars(receiver);
+    return vm.heap.allocSlots(receiver, n) catch error.OutOfMemory;
+}
+
+fn primBlockWhileFalse(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    var recv_pin: Oop = receiver;
+    var body_pin: Oop = args[0];
+    var slot_ptrs: [2]?*Oop = .{ &recv_pin, &body_pin };
+    var pin = eval_mod.RootPin{
+        .parent = vm.root_pin,
+        .slots = &slot_ptrs,
+        .n = 2,
+    };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    while (true) {
+        const cond = try vm.sendSym(recv_pin, vm.globals.sym_value, &.{});
+        if (cond != oop_mod.FALSE) break;
+        _ = try vm.sendSym(body_pin, vm.globals.sym_value, &.{});
+    }
+    return oop_mod.NIL;
+}
+
+// Large* arithmetic primitives. Receiver is always a Large; arg may
+// be Small, Large, or Float. Float ops return Float.
+const CmpKind = enum { lt, le, gt, ge, eq };
+
+fn largeArgIsNumeric(vm: *Vm, o: Oop) bool {
+    return oop_mod.isInt(o) or oop_mod.isFloat(o) or bigint.isLarge(&vm.globals, o);
+}
+
+fn primLargeAdd(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!bigint.isLarge(&vm.globals, receiver)) return error.TypeError;
+    if (oop_mod.isFloat(args[0])) {
+        const a = bigint.toF64(&vm.globals, receiver) orelse return error.TypeError;
+        return oop_mod.fromF64(a + oop_mod.toF64(args[0]));
+    }
+    if (!largeArgIsNumeric(vm, args[0])) return error.TypeError;
+    return bigint.add(vm.heap, &vm.globals, receiver, args[0]);
+}
+
+fn primLargeSub(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!bigint.isLarge(&vm.globals, receiver)) return error.TypeError;
+    if (oop_mod.isFloat(args[0])) {
+        const a = bigint.toF64(&vm.globals, receiver) orelse return error.TypeError;
+        return oop_mod.fromF64(a - oop_mod.toF64(args[0]));
+    }
+    if (!largeArgIsNumeric(vm, args[0])) return error.TypeError;
+    return bigint.sub(vm.heap, &vm.globals, receiver, args[0]);
+}
+
+fn primLargeMul(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!bigint.isLarge(&vm.globals, receiver)) return error.TypeError;
+    if (oop_mod.isFloat(args[0])) {
+        const a = bigint.toF64(&vm.globals, receiver) orelse return error.TypeError;
+        return oop_mod.fromF64(a * oop_mod.toF64(args[0]));
+    }
+    if (!largeArgIsNumeric(vm, args[0])) return error.TypeError;
+    return bigint.mul(vm.heap, &vm.globals, receiver, args[0]);
+}
+
+fn primLargeCmp(vm: *Vm, receiver: Oop, args: []const Oop, kind: CmpKind) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!bigint.isLarge(&vm.globals, receiver)) return error.TypeError;
+    if (oop_mod.isFloat(args[0])) {
+        const a = bigint.toF64(&vm.globals, receiver) orelse return error.TypeError;
+        const b = oop_mod.toF64(args[0]);
+        return oop_mod.fromBool(switch (kind) {
+            .lt => a < b,
+            .le => a <= b,
+            .gt => a > b,
+            .ge => a >= b,
+            .eq => a == b,
+        });
+    }
+    if (!(oop_mod.isInt(args[0]) or bigint.isLarge(&vm.globals, args[0]))) {
+        return if (kind == .eq) oop_mod.fromBool(false) else error.TypeError;
+    }
+    const o = bigint.cmp(&vm.globals, receiver, args[0]) orelse return error.TypeError;
+    return oop_mod.fromBool(switch (kind) {
+        .lt => o == .lt,
+        .le => o != .gt,
+        .gt => o == .gt,
+        .ge => o != .lt,
+        .eq => o == .eq,
+    });
+}
+
+fn primLargeAsString(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!bigint.isLarge(&vm.globals, receiver)) return error.TypeError;
+    return bigint.asString(vm.heap, &vm.globals, receiver);
+}
+
+fn primLargeAsFloat(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    const f = bigint.toF64(&vm.globals, receiver) orelse return error.TypeError;
+    return oop_mod.fromF64(f);
+}
+
+const FloatMathOp = enum { sqrt, sin, cos, ln, exp };
+
+fn primFloatMath(_: *Vm, receiver: Oop, args: []const Oop, op: FloatMathOp) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isFloat(receiver)) return error.TypeError;
+    const x = oop_mod.toF64(receiver);
+    const y: f64 = switch (op) {
+        .sqrt => if (x < 0) return error.PrimitiveFailed else @sqrt(x),
+        .sin => @sin(x),
+        .cos => @cos(x),
+        .ln => if (x <= 0) return error.PrimitiveFailed else @log(x),
+        .exp => @exp(x),
+    };
+    return oop_mod.fromF64(y);
+}
