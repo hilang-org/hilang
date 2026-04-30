@@ -122,6 +122,9 @@ pub const PRIM_OBJ_INST_VAR_AT: u32 = 310;
 pub const PRIM_OBJ_INST_VAR_AT_PUT: u32 = 311;
 pub const PRIM_OBJ_IS_MEMBER_OF: u32 = 312;
 pub const PRIM_BEHAVIOR_INST_VAR_NAMES: u32 = 313;
+pub const PRIM_BLOCK_IF_CURTAILED: u32 = 320;
+pub const PRIM_EXC_PASS: u32 = 321;
+pub const PRIM_EXC_RESIGNAL_AS: u32 = 322;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -223,6 +226,9 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_OBJ_INST_VAR_AT_PUT => primObjInstVarAtPut(vm, receiver, args),
         PRIM_OBJ_IS_MEMBER_OF => primObjIsMemberOf(vm, receiver, args),
         PRIM_BEHAVIOR_INST_VAR_NAMES => primBehaviorInstVarNames(vm, receiver, args),
+        PRIM_BLOCK_IF_CURTAILED => primBlockIfCurtailed(vm, receiver, args),
+        PRIM_EXC_PASS => primExceptionPass(vm, receiver, args),
+        PRIM_EXC_RESIGNAL_AS => primExceptionResignalAs(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -656,6 +662,46 @@ fn primExceptionMessageText(_: *Vm, receiver: Oop, args: []const Oop) PrimError!
     if (args.len != 0) return error.ArityMismatch;
     if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
     return object.slot(receiver, object.SLOT_EXCEPTION_MESSAGE);
+}
+
+// Block>>ifCurtailed: aBlock — like ensure: but only runs the
+// handler when the receiver escapes via an error. The original
+// error is rethrown after the handler runs. Use for cleanup
+// that should *only* fire on abnormal exit.
+fn primBlockIfCurtailed(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    var recv_pin: Oop = receiver;
+    var handler_pin: Oop = args[0];
+    var slot_ptrs: [2]?*Oop = .{ &recv_pin, &handler_pin };
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 2 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    return vm.sendSym(recv_pin, vm.globals.sym_value, &.{}) catch |e| {
+        // Best-effort handler — swallow its own error so the
+        // original propagates unchanged.
+        _ = vm.sendSym(handler_pin, vm.globals.sym_value, &.{}) catch {};
+        return e;
+    };
+}
+
+// Exception>>pass — re-raise the current exception so outer
+// on:do: handlers get a chance. The receiver is the same
+// exception instance the inner handler received.
+fn primExceptionPass(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    vm.signaled_exception = receiver;
+    return error.UserSignal;
+}
+
+// Exception>>resignalAs: anException — abandon the current
+// exception, raise a different one. Useful when wrapping a
+// low-level fault into a domain-specific exception class.
+fn primExceptionResignalAs(vm: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 1) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(args[0])) return error.TypeError;
+    vm.signaled_exception = args[0];
+    return error.UserSignal;
 }
 
 // Block>>on:do: invokes the receiver. If a UserSignal escapes whose

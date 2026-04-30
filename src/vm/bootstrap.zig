@@ -284,6 +284,9 @@ pub fn bootstrap(heap: *Heap) !Globals {
     try installPrim(heap, &g, g.string_class, "startsWith:", 1, prims.PRIM_STRING_STARTS_WITH);
     try installPrim(heap, &g, g.exception_class, "signal:", 1, prims.PRIM_EXC_SIGNAL);
     try installPrim(heap, &g, g.exception_class, "messageText", 0, prims.PRIM_EXC_MESSAGE_TEXT);
+    try installPrim(heap, &g, g.exception_class, "pass", 0, prims.PRIM_EXC_PASS);
+    try installPrim(heap, &g, g.exception_class, "resignalAs:", 1, prims.PRIM_EXC_RESIGNAL_AS);
+    try installPrim(heap, &g, g.block_closure_class, "ifCurtailed:", 1, prims.PRIM_BLOCK_IF_CURTAILED);
     try installPrim(heap, &g, g.block_closure_class, "on:do:", 2, prims.PRIM_BLOCK_ON_DO);
     try installPrim(heap, &g, g.block_closure_class, "ensure:", 1, prims.PRIM_BLOCK_ENSURE);
     try installPrim(heap, &g, g.block_closure_class, "value", 0, prims.PRIM_BLOCK_VALUE);

@@ -11,4 +11,5 @@ comptime {
     _ = @import("test_dnu.zig");
     _ = @import("test_io.zig");
     _ = @import("test_reflection.zig");
+    _ = @import("test_exceptions.zig");
 }
