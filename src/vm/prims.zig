@@ -1115,6 +1115,9 @@ fn newProcess(vm: *Vm, block: Oop, priority: i64) PrimError!Oop {
     object.setSlot(p, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
     object.setSlot(p, object.SLOT_PROCESS_RESULT, oop_mod.NIL);
     object.setSlot(p, object.SLOT_PROCESS_SUSPENDED_CONTEXT, oop_mod.NIL);
+    object.setSlot(p, object.SLOT_PROCESS_SAVED_FRAME, oop_mod.NIL);
+    object.setSlot(p, object.SLOT_PROCESS_SAVED_METHOD_FRAME, oop_mod.NIL);
+    object.setSlot(p, object.SLOT_PROCESS_SAVED_METHOD_CLASS, oop_mod.NIL);
     return p;
 }
 
@@ -1150,9 +1153,12 @@ fn schedulerEnqueue(vm: *Vm, process: Oop) void {
 
 const ForkPriorityMode = enum { from_arg };
 
-// BlockClosure>>fork  →  prim creates a Process at the default priority,
-// links it into the runnable list, and returns the Process. The block
-// is *not* executed yet; that happens once the scheduler picks it.
+// BlockClosure>>fork  →  allocate a Process at the default priority,
+// allocate it a stack + saved-Context, prepare its first-swap
+// trampoline to run the block, link it onto the scheduler's
+// runnable list, and return the Process oop. The block does *not*
+// run synchronously; it runs the next time the scheduler picks
+// this Process (e.g. on yield / wait / termination of the active).
 //
 // BlockClosure>>forkAt: aPriority  →  same with caller-supplied priority.
 fn primBlockFork(vm: *Vm, receiver: Oop, args: []const Oop, mode: ?ForkPriorityMode) PrimError!Oop {
@@ -1176,24 +1182,60 @@ fn primBlockFork(vm: *Vm, receiver: Oop, args: []const Oop, mode: ?ForkPriorityM
         if (args.len != 0) return error.ArityMismatch;
     }
 
+    // Make sure the host thread has a Process oop too — the new
+    // process needs *somewhere* to schedule back to once it's done.
+    try vm.ensureMainProcess();
+
     const p = try newProcess(vm, recv_pin, priority);
-    schedulerEnqueue(vm, p);
-    return p;
+    var p_pin: Oop = p;
+    var p_slots: [1]?*Oop = .{&p_pin};
+    var p_pin_root = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &p_slots, .n = 1 };
+    vm.root_pin = &p_pin_root;
+    defer vm.root_pin = p_pin_root.parent;
+
+    try vm.primeProcess(p_pin);
+    schedulerEnqueue(vm, p_pin);
+    return p_pin;
 }
 
-// Semaphore>>wait — decrement count when positive. With no scheduler we
-// can't suspend the active process, so a zero-count wait surfaces as
-// PrimitiveFailed; the AST fallback in stdlib turns that into a
-// signaled Exception so user code stays well-defined.
-fn primSemaphoreWait(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+// Semaphore>>wait — decrement count when positive; otherwise
+// suspend the active Process onto the semaphore's waiters queue
+// and hand control to the next runnable. When the wait returns,
+// it means another Process called signal and rescheduled us.
+fn primSemaphoreWait(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     if (args.len != 0) return error.ArityMismatch;
     if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
-    const cnt_oop = object.slot(receiver, object.SLOT_SEMA_COUNT);
+    var recv_pin: Oop = receiver;
+    var slots: [1]?*Oop = .{&recv_pin};
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slots, .n = 1 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+
+    const cnt_oop = object.slot(recv_pin, object.SLOT_SEMA_COUNT);
     if (!oop_mod.isInt(cnt_oop)) return error.TypeError;
     const cnt = oop_mod.toInt(cnt_oop);
-    if (cnt <= 0) return error.PrimitiveFailed;
-    object.setSlot(receiver, object.SLOT_SEMA_COUNT, oop_mod.fromInt(cnt - 1));
-    return receiver;
+    if (cnt > 0) {
+        object.setSlot(recv_pin, object.SLOT_SEMA_COUNT, oop_mod.fromInt(cnt - 1));
+        return recv_pin;
+    }
+    // Block the active Process on this Semaphore. Caller must have
+    // an active Process — ensureMainProcess guarantees one.
+    try vm.ensureMainProcess();
+    const active = vm.current_process;
+    object.setSlot(active, object.SLOT_PROCESS_STATE, vm.globals.sym_waiting);
+    object.setSlot(active, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+    const tail = object.slot(recv_pin, object.SLOT_SEMA_WAITERS_TAIL);
+    if (oop_mod.isHeapPtr(tail)) {
+        object.setSlot(tail, object.SLOT_PROCESS_NEXT_LINK, active);
+    } else {
+        object.setSlot(recv_pin, object.SLOT_SEMA_WAITERS_HEAD, active);
+    }
+    object.setSlot(recv_pin, object.SLOT_SEMA_WAITERS_TAIL, active);
+
+    // Hand control off. When scheduleNext eventually swaps back
+    // here, our state has been flipped to runnable by `signal`.
+    try vm.scheduleNext();
+    return recv_pin;
 }
 
 // Semaphore>>signal — increment count. If a Process is already on the
@@ -1243,12 +1285,13 @@ fn primProcessTerminate(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop
     return receiver;
 }
 
-// Processor>>yield — when there's no preemption, the active process
-// keeps running. The contract still says "you may be rescheduled
-// here," and the scheduler hooking into this primitive will satisfy
-// that. For now the primitive returns NIL.
-fn primProcessorYield(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+// Processor>>yield — push the active Process to the back of its
+// priority's runnable list and pick the next runnable. If nothing
+// else is runnable we stay where we are, matching classic
+// Smalltalk semantics ("yield is a hint, not a contract").
+fn primProcessorYield(vm: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
     if (args.len != 0) return error.ArityMismatch;
+    try vm.scheduleNext();
     return oop_mod.NIL;
 }
 

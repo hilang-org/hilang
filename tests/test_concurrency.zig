@@ -83,18 +83,148 @@ test "Semaphore signal then wait round-trips" {
     );
 }
 
-test "Semaphore wait on count=0 is a primitive failure (no scheduler yet)" {
+test "Semaphore wait on count=0 with no other process deadlocks" {
     var env: TestEnv = undefined;
     try env.init();
     defer env.deinit();
-    // Once the cooperative scheduler lands this becomes a *block*
-    // until another process signals; for now the contract is "you
-    // must not silently get past a zero-count wait".
+    // The active Process is now blocked on the semaphore's waiters
+    // queue and there's no other runnable to swap to. The
+    // scheduler surfaces this as a recoverable PrimitiveFailed
+    // rather than spinning silently.
     const result = env.evalJson(
         \\{"send":{"receiver":{"send":{"receiver":{"send":{"receiver":{"var_ref":"Semaphore"},"selector":"new","args":[]}},"selector":"init","args":[]}},
         \\"selector":"wait","args":[]}}
     );
     try std.testing.expectError(error.PrimitiveFailed, result);
+}
+
+test "fork actually runs the block once we yield" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // The block bumps a Smalltalk class-side counter on
+    // SmallInteger so we can read it back after the yield. We
+    // install a stash slot via `Smalltalk at:put:` of an
+    // OrderedCollection.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[{"send":{"receiver":{"literal":{"string":"ConcurrencyLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}]}}
+    );
+
+    // [ConcurrencyLog addLast: 'forked'] fork.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"ConcurrencyLog"},"selector":"addLast:","args":[{"literal":{"string":"forked"}}]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    // Forked block hasn't run yet — main is still active and the
+    // forked process is parked on the runnable list.
+    var size = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"ConcurrencyLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 0), vm.oop.toInt(size));
+
+    // Yielding hands control to the forked process; when it
+    // terminates, scheduleNext brings us back here.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+    size = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"ConcurrencyLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 1), vm.oop.toInt(size));
+}
+
+test "Semaphore signal wakes a waiting Process" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // Pattern: main forks a worker that waits on the semaphore;
+    // main yields so the worker actually starts and parks itself
+    // on the waiters list; main then signals, which marks the
+    // worker runnable; main yields again, the worker resumes past
+    // its wait and finishes its block.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[{"send":{"receiver":{"literal":{"string":"SyncSem"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Semaphore"},"selector":"new","args":[]}},"selector":"init","args":[]}}]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[{"send":{"receiver":{"literal":{"string":"SyncLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}]}}
+    );
+
+    // Worker block: SyncSem wait. SyncLog addLast: 'after-wait'.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"SyncSem"},"selector":"wait","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"SyncLog"},"selector":"addLast:","args":[{"literal":{"string":"after-wait"}}]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    // Yield → worker runs up to its `wait`, which parks it on
+    // SyncSem's waiters and swaps back here.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+    var size = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"SyncLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 0), vm.oop.toInt(size));
+
+    // Signal → worker becomes runnable. We yield again so it can
+    // pick up where wait left off.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"SyncSem"},"selector":"signal","args":[]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+    size = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"SyncLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 1), vm.oop.toInt(size));
+}
+
+test "two forked workers alternate via yield" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[{"send":{"receiver":{"literal":{"string":"AlternateLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}]}}
+    );
+    // Two workers each log 'A' or 'B' twice with a yield between.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"AlternateLog"},"selector":"addLast:","args":[{"literal":{"string":"A1"}}]}},
+        \\  {"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"AlternateLog"},"selector":"addLast:","args":[{"literal":{"string":"A2"}}]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"AlternateLog"},"selector":"addLast:","args":[{"literal":{"string":"B1"}}]}},
+        \\  {"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"AlternateLog"},"selector":"addLast:","args":[{"literal":{"string":"B2"}}]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    // Drive the schedule until both workers terminate.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+
+    const size = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"AlternateLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 4), vm.oop.toInt(size));
 }
 
 test "Block fork returns a runnable Process at default priority 3" {

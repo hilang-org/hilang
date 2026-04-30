@@ -182,6 +182,31 @@ pub fn prepare(
     ctx.lr = @intFromPtr(&trampoline);
 }
 
+/// Per-Process saved state. Stored as the bytes of a heap ByteArray
+/// pointed at by `Process.suspendedContext`, so the heap manages
+/// lifetime and the GC's relocation walk handles re-pointing if the
+/// ByteArray moves.
+///
+/// Saved Vm Oops (current_frame / current_method_frame /
+/// current_method_class) live in actual *slots* on the Process
+/// object — see object.SLOT_PROCESS_SAVED_*. Storing them in the
+/// byte array would make them invisible to GC.
+///
+/// `bc_pin` is a `?*BcPin` stored as `usize` so this remains an
+/// `extern struct`; the BcPin lives on the Process's native stack
+/// (mmap'd, never relocated by the GC), so a raw pointer is safe.
+///
+/// `stack_base` / `stack_size` are the mmap region backing this
+/// process's native stack — zero for the "main" process, which
+/// uses the host thread's stack. The Vm tracks every owned mmap'd
+/// stack in `process_stacks` and frees them on `Vm.deinit`.
+pub const ProcessState = extern struct {
+    ctx: Context,
+    bc_pin: usize = 0, // ?*Vm.BcPin, opaque to scheduler.zig
+    stack_base: usize = 0,
+    stack_size: usize = 0,
+};
+
 // ─────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────

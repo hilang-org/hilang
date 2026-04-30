@@ -200,7 +200,14 @@ pub const SLOT_PROCESS_NAME: u32 = 3;
 pub const SLOT_PROCESS_NEXT_LINK: u32 = 4;
 pub const SLOT_PROCESS_RESULT: u32 = 5;
 pub const SLOT_PROCESS_SUSPENDED_CONTEXT: u32 = 6;
-pub const PROCESS_INST_SIZE: u32 = 7;
+// The three "saved Vm fields" — kept as actual slot Oops (rather
+// than stuffed into the suspendedContext byte array) so GC's slot
+// walk relocates them when the heap moves. Without this a forked
+// process resumed across a GC would dereference moved-from frames.
+pub const SLOT_PROCESS_SAVED_FRAME: u32 = 7;
+pub const SLOT_PROCESS_SAVED_METHOD_FRAME: u32 = 8;
+pub const SLOT_PROCESS_SAVED_METHOD_CLASS: u32 = 9;
+pub const PROCESS_INST_SIZE: u32 = 10;
 
 // Semaphore { count, waitersHead, waitersTail }
 //   count        — SmallInt; signal increments, wait decrements when > 0.

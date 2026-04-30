@@ -8,6 +8,7 @@ const prims = @import("prims.zig");
 const frame_mod = @import("frame.zig");
 const class_mod = @import("class.zig");
 const gc_mod = @import("gc.zig");
+const scheduler_mod = @import("scheduler.zig");
 const Heap = @import("heap.zig").Heap;
 const Globals = @import("globals.zig").Globals;
 const Oop = oop_mod.Oop;
@@ -155,6 +156,19 @@ pub const Vm = struct {
     // page-faulting stack frame on every collectGarbage call.
     gc_root_buf: []*Oop = &.{},
 
+    // ── Concurrency ───────────────────────────────────────────────
+    //
+    // The currently-executing Smalltalk Process (a heap oop). NIL
+    // before the first fork; after that always points at whichever
+    // green thread we're running on right now. Mirrored into
+    // Processor.activeProcess so user code can read it.
+    current_process: Oop = oop_mod.NIL,
+    // Owned mmap'd stacks for forked processes. The Vm keeps a
+    // strong reference so they get munmap'd in `Vm.deinit` even if
+    // the owning Process oop is GC'd. ArrayList rather than a free
+    // list because process churn is low and bookkeeping cheaper.
+    process_stacks: std.ArrayList(scheduler_mod.Stack) = .empty,
+
     // Collect garbage. Roots are every Oop field on the Vm itself plus
     // the Smalltalk anchor in the heap header (the GC handles the
     // anchor). After return, any external Oops the caller is holding
@@ -193,6 +207,7 @@ pub const Vm = struct {
         try self.pushRoot(&n, &self.return_value);
         try self.pushRoot(&n, &self.return_target);
         try self.pushRoot(&n, &self.signaled_exception);
+        try self.pushRoot(&n, &self.current_process);
 
         // Walk the bytecode-pin chain. Each pin contributes its live
         // stack slots (stack[0..*sp]) as extra roots. pushRoot grows
@@ -264,6 +279,183 @@ pub const Vm = struct {
     // (between instructions); never from inside AST evaluation.
     pub fn maybeCollectGarbage(self: *Vm) !void {
         if (self.heap.used > self.heap.gc_threshold) try self.collectGarbage();
+    }
+
+    // ── Cooperative scheduler ─────────────────────────────────────
+    //
+    // Each green thread is a Smalltalk Process oop with a heap-
+    // resident ByteArray backing its `scheduler.ProcessState`
+    // (registers + saved Vm fields + mmap stack metadata). The
+    // active process is `self.current_process`; switching means
+    //   1. snapshot vm.{bc_pin, current_frame, ...} into the
+    //      active Process's ProcessState,
+    //   2. update vm.* from the target's ProcessState,
+    //   3. call scheduler.swap to actually transfer stacks.
+    // After the swap returns, this Vm is again the *previous*
+    // process — vm.* fields were just restored by whoever swapped
+    // back to us.
+
+    fn processStateOf(proc: Oop) *scheduler_mod.ProcessState {
+        const ba = object.slot(proc, object.SLOT_PROCESS_SUSPENDED_CONTEXT);
+        return @ptrCast(@alignCast(object.bytesOf(ba)));
+    }
+
+    /// Lazy creation of a Process oop representing the host thread
+    /// that started the Vm. Called the first time anything wants
+    /// to swap; cheap no-op afterwards.
+    pub fn ensureMainProcess(self: *Vm) !void {
+        if (oop_mod.isHeapPtr(self.current_process)) return;
+        if (!oop_mod.isHeapPtr(self.globals.process_class)) return;
+        const main = try self.heap.allocSlots(self.globals.process_class, object.PROCESS_INST_SIZE);
+        object.setSlot(main, object.SLOT_PROCESS_PRIORITY, oop_mod.fromInt(object.PRIORITY_USER_SCHEDULING));
+        object.setSlot(main, object.SLOT_PROCESS_STATE, self.globals.sym_runnable);
+        object.setSlot(main, object.SLOT_PROCESS_BLOCK, oop_mod.NIL);
+        object.setSlot(main, object.SLOT_PROCESS_NAME, oop_mod.NIL);
+        object.setSlot(main, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+        object.setSlot(main, object.SLOT_PROCESS_RESULT, oop_mod.NIL);
+        object.setSlot(main, object.SLOT_PROCESS_SAVED_FRAME, oop_mod.NIL);
+        object.setSlot(main, object.SLOT_PROCESS_SAVED_METHOD_FRAME, oop_mod.NIL);
+        object.setSlot(main, object.SLOT_PROCESS_SAVED_METHOD_CLASS, oop_mod.NIL);
+        const ba = try self.heap.allocBytes(self.globals.byte_array_class, @sizeOf(scheduler_mod.ProcessState));
+        // Zero-init the bytes — Context starts clean; the first
+        // swap-out into `main` writes its callee-saved state in.
+        @memset(object.bytesOf(ba)[0..@sizeOf(scheduler_mod.ProcessState)], 0);
+        object.setSlot(main, object.SLOT_PROCESS_SUSPENDED_CONTEXT, ba);
+        self.current_process = main;
+        if (oop_mod.isHeapPtr(self.globals.processor)) {
+            object.setSlot(self.globals.processor, object.SLOT_SCHEDULER_ACTIVE, main);
+        }
+    }
+
+    /// Switch from the active process to `target`. Save current
+    /// vm.* into active's ProcessState (registers + stack info) and
+    /// its slot fields (saved Vm Oops), then load target's, then
+    /// swap stacks. Returns when something else later swaps back
+    /// to us.
+    pub fn swapTo(self: *Vm, target: Oop) void {
+        if (target == self.current_process) return;
+        const prev = self.current_process;
+        const prev_state = processStateOf(prev);
+        prev_state.bc_pin = @intFromPtr(self.bc_pin);
+        object.setSlot(prev, object.SLOT_PROCESS_SAVED_FRAME, self.current_frame);
+        object.setSlot(prev, object.SLOT_PROCESS_SAVED_METHOD_FRAME, self.current_method_frame);
+        object.setSlot(prev, object.SLOT_PROCESS_SAVED_METHOD_CLASS, self.current_method_class);
+
+        self.current_process = target;
+        if (oop_mod.isHeapPtr(self.globals.processor)) {
+            object.setSlot(self.globals.processor, object.SLOT_SCHEDULER_ACTIVE, target);
+        }
+        const tgt_state = processStateOf(target);
+        self.bc_pin = @ptrFromInt(tgt_state.bc_pin);
+        self.current_frame = object.slot(target, object.SLOT_PROCESS_SAVED_FRAME);
+        self.current_method_frame = object.slot(target, object.SLOT_PROCESS_SAVED_METHOD_FRAME);
+        self.current_method_class = object.slot(target, object.SLOT_PROCESS_SAVED_METHOD_CLASS);
+
+        scheduler_mod.swap(&prev_state.ctx, &tgt_state.ctx);
+    }
+
+    /// Pop the head of the highest-priority non-empty runnable list.
+    /// NIL when nobody is runnable.
+    fn dequeueHighestRunnable(self: *Vm) Oop {
+        const sched = self.globals.processor;
+        if (!oop_mod.isHeapPtr(sched)) return oop_mod.NIL;
+        const lists = object.slot(sched, object.SLOT_SCHEDULER_QLISTS);
+        if (!oop_mod.isHeapPtr(lists)) return oop_mod.NIL;
+        const cap = object.headerOf(lists).size;
+        var pri: u32 = if (cap > object.MAX_PRIORITY) object.MAX_PRIORITY else cap - 1;
+        while (pri >= 1) : (pri -= 1) {
+            const head = object.slot(lists, pri);
+            if (!oop_mod.isHeapPtr(head)) {
+                if (pri == 0) break;
+                continue;
+            }
+            const next = object.slot(head, object.SLOT_PROCESS_NEXT_LINK);
+            object.setSlot(lists, pri, next);
+            object.setSlot(head, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+            return head;
+        }
+        return oop_mod.NIL;
+    }
+
+    /// Append a Process at the tail of its priority's runnable list.
+    /// Used by yield (when active is still runnable) and by signal/
+    /// resume.
+    pub fn enqueueRunnable(self: *Vm, process: Oop) void {
+        const sched = self.globals.processor;
+        if (!oop_mod.isHeapPtr(sched)) return;
+        const lists = object.slot(sched, object.SLOT_SCHEDULER_QLISTS);
+        if (!oop_mod.isHeapPtr(lists)) return;
+        const pri_oop = object.slot(process, object.SLOT_PROCESS_PRIORITY);
+        if (!oop_mod.isInt(pri_oop)) return;
+        const pri: u32 = @intCast(@max(@as(i64, 1), @min(@as(i64, object.MAX_PRIORITY), oop_mod.toInt(pri_oop))));
+        if (pri >= object.headerOf(lists).size) return;
+        object.setSlot(process, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+        const head = object.slot(lists, pri);
+        if (oop_mod.isNil(head)) {
+            object.setSlot(lists, pri, process);
+            return;
+        }
+        var cur = head;
+        while (true) {
+            const nxt = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+            if (oop_mod.isNil(nxt)) break;
+            cur = nxt;
+        }
+        object.setSlot(cur, object.SLOT_PROCESS_NEXT_LINK, process);
+    }
+
+    /// Pick the highest-priority runnable Process and swap to it.
+    /// If the active is still runnable (voluntary yield), it gets
+    /// re-enqueued so it'll come back later.
+    ///
+    /// Three terminal cases:
+    ///   * Active is runnable and nobody else is queued → no-op,
+    ///     continue running active.
+    ///   * Active is non-runnable (waiting/terminated/suspended)
+    ///     and the runnable list is empty → deadlock; raise
+    ///     PrimitiveFailed so the caller surfaces something useful
+    ///     instead of dropping into an unrecoverable state.
+    ///   * Otherwise → swap to the dequeued process.
+    pub fn scheduleNext(self: *Vm) !void {
+        try self.ensureMainProcess();
+        const active = self.current_process;
+        const active_state = object.slot(active, object.SLOT_PROCESS_STATE);
+        const next = self.dequeueHighestRunnable();
+        if (oop_mod.isNil(next)) {
+            if (active_state != self.globals.sym_runnable) return error.PrimitiveFailed;
+            return;
+        }
+        if (next == active) return;
+        if (active_state == self.globals.sym_runnable) {
+            self.enqueueRunnable(active);
+        }
+        self.swapTo(next);
+    }
+
+    /// Allocate a stack + ProcessState for a fresh Process so the
+    /// first swap-into it lands in `processEntry(self)`. The Process
+    /// must already have its block / priority / etc. slots filled.
+    pub fn primeProcess(self: *Vm, proc: Oop) EvalError!void {
+        if (!oop_mod.isHeapPtr(proc)) return error.TypeError;
+        const ba = try self.heap.allocBytes(self.globals.byte_array_class, @sizeOf(scheduler_mod.ProcessState));
+        @memset(object.bytesOf(ba)[0..@sizeOf(scheduler_mod.ProcessState)], 0);
+        object.setSlot(proc, object.SLOT_PROCESS_SUSPENDED_CONTEXT, ba);
+        // mmap can fail with platform-specific error codes that
+        // aren't part of EvalError; squash them into OutOfMemory
+        // so primitives can `try` without enumerating mmap errors.
+        // 2 MiB matches the conservative side of classic Smalltalk
+        // green-thread defaults; smaller (e.g. 128 KiB) overflowed
+        // when a forked block triggered AST→bytecode compile of a
+        // nested send.
+        const stack = scheduler_mod.Stack.alloc(2 * 1024 * 1024) catch return error.OutOfMemory;
+        self.process_stacks.append(std.heap.page_allocator, stack) catch return error.OutOfMemory;
+        const state = processStateOf(proc);
+        state.* = .{
+            .ctx = .{},
+            .stack_base = @intFromPtr(stack.base.ptr),
+            .stack_size = stack.base.len,
+        };
+        scheduler_mod.prepare(&state.ctx, stack, processEntry, self);
     }
 
     pub fn classOf(self: *const Vm, o: Oop) Oop {
@@ -1257,6 +1449,34 @@ pub const Vm = struct {
 pub fn symbolBytes(sym: Oop) []const u8 {
     const hdr = object.headerOf(sym);
     return object.bytesOf(sym)[0..hdr.size];
+}
+
+// Entry trampoline for a freshly-forked Process. The first time the
+// scheduler swaps INTO this process, control lands here (via
+// scheduler.prepare → scheduler.trampoline → us). We pull the block
+// off the Process oop, run it, stash the return value, mark the
+// Process terminated, and hand control to the next runnable thread
+// (typically the main host thread if nothing else is queued).
+fn processEntry(arg: ?*anyopaque) callconv(.c) noreturn {
+    const vm: *Vm = @ptrCast(@alignCast(arg.?));
+    const proc = vm.current_process;
+    const block = object.slot(proc, object.SLOT_PROCESS_BLOCK);
+    var result: Oop = oop_mod.NIL;
+    if (oop_mod.isHeapPtr(block)) {
+        result = vm.send(block, "value", &.{}) catch oop_mod.NIL;
+    }
+    object.setSlot(proc, object.SLOT_PROCESS_RESULT, result);
+    object.setSlot(proc, object.SLOT_PROCESS_STATE, vm.globals.sym_terminated);
+    // Find someone to hand the host thread back to. If the runnable
+    // list is empty, every other Process has finished too — but the
+    // host's main Process is special-cased: it's not on the runnable
+    // list when active, so when its yield returns it picks up where
+    // it left off. Reach into it directly here.
+    vm.scheduleNext() catch {};
+    // If we get here, the main Process must have been re-enqueued
+    // somewhere along the way and we already swapped to it. Reaching
+    // this line means scheduleNext found nothing — that's a bug.
+    @panic("processEntry: no runnable Process after termination");
 }
 
 pub fn invokeBlock(vm: *Vm, block: Oop, args: []const Oop) EvalError!Oop {

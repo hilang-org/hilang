@@ -2049,7 +2049,11 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
         g,
         "Process",
         g.object_class,
-        &.{ "priority", "state", "block", "name", "nextLink", "result", "suspendedContext" },
+        &.{
+            "priority", "state",     "block",      "name",
+            "nextLink", "result",    "suspendedContext",
+            "savedFrame", "savedMethodFrame", "savedMethodClass",
+        },
     );
     g.process_class = process_class;
 
