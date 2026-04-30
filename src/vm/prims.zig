@@ -1387,49 +1387,26 @@ fn primTimeMonoNanos(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
     return oop_mod.fromInt(nanos);
 }
 
-// IPv4 socket primitives. Receiver is a Socket whose first ivar
-// (slot 0) holds the underlying fd — same convention as
-// FileStream so the read:/readAll/nextPutAll:/primClose prims
-// installed on Socket below operate on the fd. Hostnames must
-// be dotted IPv4 literals; DNS resolution is out of scope for
-// this commit.
+// IPv4/IPv6 + DNS socket primitives. Receiver is a Socket whose
+// first ivar (slot 0) holds the underlying fd — same convention
+// as FileStream so the read:/readAll/nextPutAll:/primClose
+// prims installed on Socket below operate on the fd. Hostnames
+// route through getaddrinfo so dotted-quad literals AND real
+// DNS names both work.
 
-fn parseIp4(s: []const u8) ?u32 {
-    var parts: [4]u32 = undefined;
-    var idx: u32 = 0;
-    var cur: u32 = 0;
-    var saw: bool = false;
-    var p: usize = 0;
-    while (p < s.len) : (p += 1) {
-        const ch = s[p];
-        if (ch >= '0' and ch <= '9') {
-            cur = cur * 10 + (ch - '0');
-            if (cur > 255) return null;
-            saw = true;
-        } else if (ch == '.') {
-            if (!saw or idx >= 3) return null;
-            parts[idx] = cur;
-            idx += 1;
-            cur = 0;
-            saw = false;
-        } else return null;
-    }
-    if (!saw or idx != 3) return null;
-    parts[3] = cur;
-    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
-}
-
-fn buildSockaddrIn(ip_be: u32, port: u16) std.posix.sockaddr.in {
+fn buildSockaddrIn(port: u16) std.posix.sockaddr.in {
     return .{
         .port = std.mem.nativeToBig(u16, port),
-        .addr = std.mem.nativeToBig(u32, ip_be),
+        .addr = 0,
     };
 }
 
 // Socket>>primConnect: aHost port: aPort
-//   aHost must be a dotted IPv4 string (DNS not yet supported).
-//   Stores the connected fd into the receiver's slot 0 and
-//   returns the receiver so chains compose.
+//   aHost may be an IPv4 literal, an IPv6 literal, or a DNS
+//   hostname; getaddrinfo handles all three. Walks the result
+//   list trying socket()+connect() for each addrinfo until one
+//   succeeds. Stores the fd into receiver's slot 0; returns
+//   receiver so chains compose.
 fn primSockConnect(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     if (args.len != 2) return error.ArityMismatch;
     if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
@@ -1438,20 +1415,50 @@ fn primSockConnect(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     const host_hdr = object.headerOf(args[0]);
     if ((host_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
     const host_bytes = object.bytesOf(args[0])[0..host_hdr.size];
-    const ip = parseIp4(host_bytes) orelse return error.PrimitiveFailed;
+    if (host_bytes.len + 1 > 256) return error.PrimitiveFailed;
     const port_int = oop_mod.toInt(args[1]);
     if (port_int < 0 or port_int > 65535) return error.PrimitiveFailed;
 
-    const fd = std.posix.system.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-    if (fd < 0) return error.PrimitiveFailed;
-    const sa = buildSockaddrIn(ip, @intCast(port_int));
-    const sa_ptr: *const std.posix.sockaddr = @ptrCast(&sa);
-    if (std.posix.system.connect(fd, sa_ptr, @sizeOf(@TypeOf(sa))) != 0) {
+    var host_buf: [256]u8 = undefined;
+    @memcpy(host_buf[0..host_bytes.len], host_bytes);
+    host_buf[host_bytes.len] = 0;
+    const host_z: [*:0]const u8 = @ptrCast(&host_buf);
+
+    var port_buf: [8]u8 = undefined;
+    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port_int}) catch return error.PrimitiveFailed;
+    if (port_str.len + 1 > port_buf.len) return error.PrimitiveFailed;
+    var port_z_buf: [8]u8 = undefined;
+    @memcpy(port_z_buf[0..port_str.len], port_str);
+    port_z_buf[port_str.len] = 0;
+    const port_z: [*:0]const u8 = @ptrCast(&port_z_buf);
+
+    var hints: std.posix.system.addrinfo = std.mem.zeroes(std.posix.system.addrinfo);
+    hints.family = std.posix.AF.UNSPEC;
+    hints.socktype = std.posix.SOCK.STREAM;
+
+    var res: ?*std.posix.system.addrinfo = null;
+    const eai = std.posix.system.getaddrinfo(host_z, port_z, &hints, &res);
+    if (@intFromEnum(eai) != 0) return error.PrimitiveFailed;
+    defer if (res) |r| std.posix.system.freeaddrinfo(r);
+
+    // Try each result in order. accept() can fail for
+    // various reasons (unsupported family, refused connection);
+    // continue to the next addrinfo before giving up.
+    var ai_opt: ?*std.posix.system.addrinfo = res;
+    while (ai_opt) |ai| : (ai_opt = ai.next) {
+        const fd = std.posix.system.socket(@intCast(ai.family), @intCast(ai.socktype), @intCast(ai.protocol));
+        if (fd < 0) continue;
+        const addr = ai.addr orelse {
+            _ = std.posix.system.close(fd);
+            continue;
+        };
+        if (std.posix.system.connect(fd, addr, ai.addrlen) == 0) {
+            object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
+            return receiver;
+        }
         _ = std.posix.system.close(fd);
-        return error.PrimitiveFailed;
     }
-    object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
-    return receiver;
+    return error.PrimitiveFailed;
 }
 
 // Socket>>primListen: aPort  — bind to 0.0.0.0:aPort with
@@ -1468,7 +1475,7 @@ fn primSockListen(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     if (fd < 0) return error.PrimitiveFailed;
     const reuse: c_int = 1;
     _ = std.posix.system.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, &reuse, @sizeOf(c_int));
-    const sa = buildSockaddrIn(0, @intCast(port_int));
+    const sa = buildSockaddrIn(@intCast(port_int));
     const sa_ptr: *const std.posix.sockaddr = @ptrCast(&sa);
     if (std.posix.system.bind(fd, sa_ptr, @sizeOf(@TypeOf(sa))) != 0) {
         _ = std.posix.system.close(fd);

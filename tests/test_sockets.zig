@@ -98,14 +98,46 @@ test "connect to a closed port raises PrimitiveFailed" {
     try std.testing.expectError(error.PrimitiveFailed, result);
 }
 
-test "non-IPv4 host string raises PrimitiveFailed" {
+test "DNS hostname resolves through getaddrinfo" {
+    // 'localhost' should resolve to 127.0.0.1 (or ::1) and connect
+    // to the listener established below. Proves getaddrinfo is
+    // wired and the result list is walked.
     var env: TestEnv = undefined;
     try env.init();
     defer env.deinit();
-    // DNS is out of scope; hostnames must be dotted-quad literals.
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"DnsServer"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Socket"},"selector":"listenOn:","args":[{"literal":{"int":47918}}]}}
+        \\]}}
+    );
+    // Connect via hostname rather than literal IP.
+    const cli = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Socket"},"selector":"connectTo:port:","args":[
+        \\  {"literal":{"string":"localhost"}},{"literal":{"int":47918}}
+        \\]}}
+    );
+    try std.testing.expect(vm.oop.isHeapPtr(cli));
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"DnsCli"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Socket"},"selector":"connectTo:port:","args":[
+        \\    {"literal":{"string":"localhost"}},{"literal":{"int":47918}}
+        \\  ]}}
+        \\]}}
+    );
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"DnsCli\"},\"selector\":\"close\",\"args\":[]}}");
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"DnsServer\"},\"selector\":\"close\",\"args\":[]}}");
+}
+
+test "garbage hostname still raises PrimitiveFailed" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
     const result = env.evalJson(
         \\{"send":{"receiver":{"var_ref":"Socket"},"selector":"connectTo:port:","args":[
-        \\  {"literal":{"string":"localhost"}},{"literal":{"int":80}}
+        \\  {"literal":{"string":"this.is.not.a.real.tld.zzz.invalid"}},{"literal":{"int":80}}
         \\]}}
     );
     try std.testing.expectError(error.PrimitiveFailed, result);
