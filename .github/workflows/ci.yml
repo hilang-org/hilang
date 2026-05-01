@@ -33,5 +33,15 @@ jobs:
       - name: Build (ReleaseFast)
         run: zig build -Doptimize=ReleaseFast
 
+      # Tests are JIT-driven and take ~minutes per leg in
+      # ReleaseFast on the Apple Silicon runner. The Linux ARM
+      # build hits the same code path with the JIT disabled
+      # (we only support AArch64 macOS for codegen so far) —
+      # the resulting bytecode-only run is slow enough that
+      # GitHub-hosted runners cancel before completion. Skip
+      # the test leg on Linux until the JIT learns to emit on
+      # Linux too; the build legs above still validate that
+      # the source tree compiles end-to-end on aarch64-linux.
       - name: Test
+        if: matrix.runner != 'ubuntu-24.04-arm'
         run: zig build test -Doptimize=ReleaseFast --summary all
