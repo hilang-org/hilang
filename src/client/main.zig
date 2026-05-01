@@ -1,6 +1,8 @@
 const std = @import("std");
+const noise = @import("noise");
 
 const DEFAULT_SOCKET = "/tmp/hilang.sock";
+const MAX_RESPONSE: usize = 1 * 1024 * 1024;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.DebugAllocator(.{}).init;
@@ -19,10 +21,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     var socket_path: []const u8 = DEFAULT_SOCKET;
+    var host: ?[]const u8 = null;
+    var port: ?u16 = null;
+    var noise_secret_path: ?[]const u8 = null;
+    var noise_peer_path: ?[]const u8 = null;
     var idx: usize = 0;
     while (idx < args_list.items.len) : (idx += 1) {
         if (std.mem.eql(u8, args_list.items[idx], "--socket") and idx + 1 < args_list.items.len) {
             socket_path = args_list.items[idx + 1];
+            idx += 1;
+        } else if (std.mem.eql(u8, args_list.items[idx], "--host") and idx + 1 < args_list.items.len) {
+            host = args_list.items[idx + 1];
+            idx += 1;
+        } else if (std.mem.eql(u8, args_list.items[idx], "--port") and idx + 1 < args_list.items.len) {
+            port = try std.fmt.parseInt(u16, args_list.items[idx + 1], 10);
+            idx += 1;
+        } else if (std.mem.eql(u8, args_list.items[idx], "--noise-secret") and idx + 1 < args_list.items.len) {
+            noise_secret_path = args_list.items[idx + 1];
+            idx += 1;
+        } else if (std.mem.eql(u8, args_list.items[idx], "--noise-peer") and idx + 1 < args_list.items.len) {
+            noise_peer_path = args_list.items[idx + 1];
             idx += 1;
         } else {
             break;
@@ -37,8 +55,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const cmd = args_list.items[idx];
     idx += 1;
 
+    if (std.mem.eql(u8, cmd, "noise-keygen")) {
+        if (idx >= args_list.items.len) {
+            std.debug.print("noise-keygen: missing output prefix\n", .{});
+            std.process.exit(2);
+        }
+        try keygen(allocator, args_list.items[idx]);
+        return;
+    }
+
     if (std.mem.eql(u8, cmd, "ping")) {
-        try sendRequest(allocator, socket_path, "{\"kind\":\"ping\"}");
+        try sendRequest(allocator, socket_path, host, port, noise_secret_path, noise_peer_path, "{\"kind\":\"ping\"}");
         return;
     }
 
@@ -55,7 +82,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try req.appendSlice(allocator, node_json);
         try req.appendSlice(allocator, "}");
 
-        try sendRequest(allocator, socket_path, req.items);
+        try sendRequest(allocator, socket_path, host, port, noise_secret_path, noise_peer_path, req.items);
         return;
     }
 
@@ -72,7 +99,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try appendJsonString(allocator, &req, source);
         try req.append(allocator, '}');
 
-        try sendRequest(allocator, socket_path, req.items);
+        try sendRequest(allocator, socket_path, host, port, noise_secret_path, noise_peer_path, req.items);
         return;
     }
 
@@ -86,17 +113,37 @@ fn usage() !void {
         \\
         \\Usage:
         \\  hilang [--socket PATH] <command> [args...]
+        \\  hilang --host HOST --port PORT --noise-secret KEY --noise-peer KEY <command> [args...]
         \\
         \\Commands:
         \\  ping                 health check
         \\  eval <ast-json>      evaluate an AST node, print response
         \\  eval-st <source>     evaluate canonical Smalltalk source
+        \\  noise-keygen PREFIX  write PREFIX.noise-secret / PREFIX.noise-public
         \\
     ;
     std.debug.print("{s}", .{msg});
 }
 
-fn sendRequest(allocator: std.mem.Allocator, socket_path: []const u8, request: []const u8) !void {
+fn sendRequest(
+    allocator: std.mem.Allocator,
+    socket_path: []const u8,
+    host: ?[]const u8,
+    port: ?u16,
+    noise_secret_path: ?[]const u8,
+    noise_peer_path: ?[]const u8,
+    request: []const u8,
+) !void {
+    if ((host != null) or (port != null)) {
+        if (host == null or port == null) return error.BadRequest;
+        if (noise_secret_path == null or noise_peer_path == null) return error.BadRequest;
+        return sendRequestNoise(allocator, host.?, port.?, noise_secret_path.?, noise_peer_path.?, request);
+    }
+    if (noise_secret_path != null or noise_peer_path != null) return error.BadRequest;
+    return sendRequestUnix(allocator, socket_path, request);
+}
+
+fn sendRequestUnix(allocator: std.mem.Allocator, socket_path: []const u8, request: []const u8) !void {
     const fd = std.posix.system.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     defer _ = std.posix.system.close(fd);
@@ -125,6 +172,45 @@ fn sendRequest(allocator: std.mem.Allocator, socket_path: []const u8, request: [
     const end = std.mem.indexOfScalar(u8, resp.items, '\n') orelse resp.items.len;
     _ = std.posix.system.write(1, resp.items.ptr, end);
     _ = std.posix.system.write(1, "\n", 1);
+}
+
+fn sendRequestNoise(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    secret_path: []const u8,
+    peer_path: []const u8,
+    request: []const u8,
+) !void {
+    const local_static = try noise.loadSecretKeyFile(allocator, secret_path);
+    const peer = try noise.loadPublicKeyFile(allocator, peer_path);
+    const fd = try noise.tcpConnect(host, port);
+    defer _ = std.posix.system.close(fd);
+
+    var chan = try noise.clientHandshake(allocator, fd, local_static, peer);
+    try chan.sendFrame(allocator, fd, request);
+    const resp = try chan.recvFrame(allocator, fd, MAX_RESPONSE);
+    defer allocator.free(resp);
+
+    _ = std.posix.system.write(1, resp.ptr, resp.len);
+    _ = std.posix.system.write(1, "\n", 1);
+}
+
+fn keygen(allocator: std.mem.Allocator, prefix: []const u8) !void {
+    const kp = try noise.generateKeyPair();
+    const secret_path = try std.fmt.allocPrint(allocator, "{s}.noise-secret", .{prefix});
+    defer allocator.free(secret_path);
+    const public_path = try std.fmt.allocPrint(allocator, "{s}.noise-public", .{prefix});
+    defer allocator.free(public_path);
+
+    try noise.writeKeyFile(secret_path, kp.secret_key);
+    try noise.writeKeyFile(public_path, kp.public_key);
+
+    var pub_hex: [64]u8 = undefined;
+    std.debug.print(
+        "wrote {s}\nwrote {s}\npublic {s}\n",
+        .{ secret_path, public_path, noise.encodeKeyHex(&pub_hex, kp.public_key) },
+    );
 }
 
 fn writeAll(fd: std.posix.fd_t, buf: []const u8) !void {

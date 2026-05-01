@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const vm = @import("vm");
+const noise = @import("noise");
 
 const DEFAULT_SOCKET = "/tmp/hilang.sock";
 const HEAP_BYTES: usize = 256 * 1024 * 1024;
@@ -12,13 +13,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = gpa.allocator();
 
     // Args: [--socket PATH] [--image PATH] [--heap-mb N]
+    //       [--listen-host HOST --listen-port PORT --noise-secret PATH [--noise-allow-peer PATH]...]
     var socket_path: []const u8 = DEFAULT_SOCKET;
     var image_path: ?[]const u8 = null;
     var heap_bytes: usize = HEAP_BYTES;
+    var listen_host: []const u8 = "*";
+    var listen_port: ?u16 = null;
+    var noise_secret_path: ?[]const u8 = null;
     var it = std.process.Args.Iterator.init(init.args);
     _ = it.skip(); // program name
     var args_list: std.ArrayList([]const u8) = .empty;
+    var allow_peer_paths: std.ArrayList([]const u8) = .empty;
     defer {
+        allow_peer_paths.deinit(allocator);
         for (args_list.items) |s| allocator.free(s);
         args_list.deinit(allocator);
     }
@@ -35,6 +42,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
             i += 1;
         } else if (std.mem.eql(u8, args_list.items[i], "--heap-mb") and i + 1 < args_list.items.len) {
             heap_bytes = (try std.fmt.parseInt(usize, args_list.items[i + 1], 10)) * 1024 * 1024;
+            i += 1;
+        } else if (std.mem.eql(u8, args_list.items[i], "--listen-host") and i + 1 < args_list.items.len) {
+            listen_host = args_list.items[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args_list.items[i], "--listen-port") and i + 1 < args_list.items.len) {
+            listen_port = try std.fmt.parseInt(u16, args_list.items[i + 1], 10);
+            i += 1;
+        } else if (std.mem.eql(u8, args_list.items[i], "--noise-secret") and i + 1 < args_list.items.len) {
+            noise_secret_path = args_list.items[i + 1];
+            i += 1;
+        } else if (std.mem.eql(u8, args_list.items[i], "--noise-allow-peer") and i + 1 < args_list.items.len) {
+            try allow_peer_paths.append(allocator, args_list.items[i + 1]);
             i += 1;
         }
     }
@@ -53,6 +72,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer heap.deinit();
 
     var machine = vm.Vm{ .heap = &heap, .globals = g };
+
+    if (listen_port) |port| {
+        if (noise_secret_path == null) return error.BadRequest;
+        const local_static = try noise.loadSecretKeyFile(allocator, noise_secret_path.?);
+        var allowed_peers: std.ArrayList(noise.PublicKey) = .empty;
+        defer allowed_peers.deinit(allocator);
+        for (allow_peer_paths.items) |path| {
+            try allowed_peers.append(allocator, try noise.loadPublicKeyFile(allocator, path));
+        }
+
+        const listen_fd = try noise.tcpListen(listen_host, port);
+        defer _ = std.posix.system.close(listen_fd);
+
+        var pub_hex: [64]u8 = undefined;
+        std.debug.print(
+            "hilang-vm: secure Noise listen on {s}:{d} as {s} (heap {d} MiB)\n",
+            .{ listen_host, port, noise.encodeKeyHex(&pub_hex, local_static.public_key), heap_bytes / (1024 * 1024) },
+        );
+
+        while (true) {
+            const conn_fd = std.posix.system.accept(listen_fd, null, null);
+            if (conn_fd < 0) {
+                std.debug.print("accept error\n", .{});
+                continue;
+            }
+            handleNoiseConn(allocator, &machine, conn_fd, local_static, allowed_peers.items) catch |e| {
+                std.debug.print("secure conn error: {s}\n", .{@errorName(e)});
+            };
+            _ = std.posix.system.close(conn_fd);
+        }
+    }
 
     // Remove any stale socket. Ignore errors (likely ENOENT).
     {
@@ -137,12 +187,32 @@ fn handleConn(allocator: std.mem.Allocator, machine: *vm.Vm, fd: std.posix.fd_t)
 
     const newline_idx = std.mem.indexOfScalar(u8, buf.items, '\n') orelse buf.items.len;
     const line = buf.items[0..newline_idx];
+    const resp = try buildResponse(allocator, machine, line);
+    defer allocator.free(resp);
+    try writeAll(fd, resp);
+    try writeAll(fd, "\n");
+}
 
+fn handleNoiseConn(
+    allocator: std.mem.Allocator,
+    machine: *vm.Vm,
+    fd: std.posix.fd_t,
+    local_static: noise.KeyPair,
+    allowed_peers: []const noise.PublicKey,
+) !void {
+    var chan = try noise.serverHandshake(allocator, fd, local_static, allowed_peers);
+    const line = try chan.recvFrame(allocator, fd, MAX_REQUEST);
+    defer allocator.free(line);
+    const resp = try buildResponse(allocator, machine, line);
+    defer allocator.free(resp);
+    try chan.sendFrame(allocator, fd, resp);
+}
+
+fn buildResponse(allocator: std.mem.Allocator, machine: *vm.Vm, line: []const u8) ![]u8 {
     var resp: std.ArrayList(u8) = .empty;
-    defer resp.deinit(allocator);
+    errdefer resp.deinit(allocator);
     try dispatch(allocator, machine, line, &resp);
-    try resp.append(allocator, '\n');
-    try writeAll(fd, resp.items);
+    return resp.toOwnedSlice(allocator);
 }
 
 fn dispatch(allocator: std.mem.Allocator, machine: *vm.Vm, line: []const u8, out: *std.ArrayList(u8)) !void {

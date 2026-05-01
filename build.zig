@@ -18,6 +18,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    const net_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/noise.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/server/main.zig"),
         .target = target,
@@ -25,6 +32,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     server_mod.addImport("vm", vm_mod);
+    server_mod.addImport("noise", net_mod);
 
     const server_exe = b.addExecutable(.{
         .name = "hilang-vm",
@@ -38,6 +46,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    client_mod.addImport("noise", net_mod);
 
     const client_exe = b.addExecutable(.{
         .name = "hilang",
@@ -72,6 +81,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     tests_mod.addImport("vm", vm_mod);
+    tests_mod.addImport("noise", net_mod);
     const protocol_tests = b.addTest(.{ .root_module = tests_mod });
     const run_protocol_tests = b.addRunArtifact(protocol_tests);
     test_step.dependOn(&run_protocol_tests.step);

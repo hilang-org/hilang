@@ -21,4 +21,5 @@ comptime {
     _ = @import("test_nonblocking.zig");
     _ = @import("test_random.zig");
     _ = @import("test_smalltalk.zig");
+    _ = @import("test_noise.zig");
 }
