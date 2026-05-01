@@ -2350,7 +2350,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
             "priority", "state",     "block",      "name",
             "nextLink", "result",    "suspendedContext",
             "savedFrame", "savedMethodFrame", "savedMethodClass",
-            "deadline", "waitFd", "waitEvent", "waitDeadline", "onCrash",
+            "deadline", "waitFd", "waitEvent", "waitDeadline", "onCrash", "joiners",
         },
     );
     g.process_class = process_class;

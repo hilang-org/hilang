@@ -225,7 +225,12 @@ pub const SLOT_PROCESS_WAIT_DEADLINE: u32 = 13;
 // with a UserSignal exception. NIL means "swallow silently"
 // (the existing behavior). Set via Process>>onCrash:.
 pub const SLOT_PROCESS_ON_CRASH: u32 = 14;
-pub const PROCESS_INST_SIZE: u32 = 15;
+// Head of a singly-linked list of green threads parked in
+// `Process>>join`. Linked through SLOT_PROCESS_NEXT_LINK on
+// each joiner. Walked in processEntry on termination to wake
+// every joiner before the process is reaped.
+pub const SLOT_PROCESS_JOINERS: u32 = 15;
+pub const PROCESS_INST_SIZE: u32 = 16;
 
 // Semaphore { count, waitersHead, waitersTail }
 //   count        — SmallInt; signal increments, wait decrements when > 0.

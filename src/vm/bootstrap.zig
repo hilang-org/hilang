@@ -352,6 +352,7 @@ pub fn bootstrap(heap: *Heap) !Globals {
     try installPrim(heap, &g, g.process_class, "resume", 0, prims.PRIM_PROCESS_RESUME);
     try installPrim(heap, &g, g.process_class, "suspend", 0, prims.PRIM_PROCESS_SUSPEND);
     try installPrim(heap, &g, g.process_class, "terminate", 0, prims.PRIM_PROCESS_TERMINATE);
+    try installPrim(heap, &g, g.process_class, "join", 0, prims.PRIM_PROCESS_JOIN);
     try installPrim(heap, &g, g.scheduler_class, "yield", 0, prims.PRIM_PROCESSOR_YIELD);
     try installPrim(heap, &g, g.scheduler_class, "activeProcess", 0, prims.PRIM_PROCESSOR_ACTIVE);
 

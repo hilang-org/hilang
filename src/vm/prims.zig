@@ -109,6 +109,7 @@ pub const PRIM_SEMAPHORE_SIGNAL: u32 = 211;
 pub const PRIM_PROCESS_RESUME: u32 = 220;
 pub const PRIM_PROCESS_SUSPEND: u32 = 221;
 pub const PRIM_PROCESS_TERMINATE: u32 = 222;
+pub const PRIM_PROCESS_JOIN: u32 = 223;
 pub const PRIM_PROCESSOR_YIELD: u32 = 230;
 pub const PRIM_PROCESSOR_ACTIVE: u32 = 231;
 pub const PRIM_TIME_MONO_NANOS: u32 = 240;
@@ -228,6 +229,7 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_PROCESS_RESUME => primProcessResume(vm, receiver, args),
         PRIM_PROCESS_SUSPEND => primProcessSuspend(vm, receiver, args),
         PRIM_PROCESS_TERMINATE => primProcessTerminate(vm, receiver, args),
+        PRIM_PROCESS_JOIN => primProcessJoin(vm, receiver, args),
         PRIM_PROCESSOR_YIELD => primProcessorYield(vm, receiver, args),
         PRIM_PROCESSOR_ACTIVE => primProcessorActive(vm, receiver, args),
         PRIM_TIME_MONO_NANOS => primTimeMonoNanos(vm, receiver, args),
@@ -1470,6 +1472,7 @@ fn newProcess(vm: *Vm, block: Oop, priority: i64) PrimError!Oop {
     object.setSlot(p, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(0));
     object.setSlot(p, object.SLOT_PROCESS_WAIT_DEADLINE, oop_mod.fromInt(0));
     object.setSlot(p, object.SLOT_PROCESS_ON_CRASH, oop_mod.NIL);
+    object.setSlot(p, object.SLOT_PROCESS_JOINERS, oop_mod.NIL);
     return p;
 }
 
@@ -1635,6 +1638,46 @@ fn primProcessTerminate(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop
     if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
     object.setSlot(receiver, object.SLOT_PROCESS_STATE, vm.globals.sym_terminated);
     return receiver;
+}
+
+// Process>>join — block until receiver terminates, then return
+// its result slot. If receiver has already terminated, return
+// the result without blocking. Joining your own active process
+// is a guaranteed deadlock — surface PrimitiveFailed instead.
+fn primProcessJoin(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+
+    // Pin receiver across scheduleNext: reapTerminated runs
+    // inside dequeueHighestRunnable and may unlink the joined
+    // process from `Vm.all_processes` once it terminates,
+    // dropping its GC root. The pin keeps it alive while we
+    // read the result slot below.
+    var recv_pin: Oop = receiver;
+    var slots: [1]?*Oop = .{&recv_pin};
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slots, .n = 1 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+
+    if (object.slot(recv_pin, object.SLOT_PROCESS_STATE) == vm.globals.sym_terminated) {
+        return object.slot(recv_pin, object.SLOT_PROCESS_RESULT);
+    }
+
+    try vm.ensureMainProcess();
+    const active = vm.current_process;
+    if (active == recv_pin) return error.PrimitiveFailed;
+
+    // Park the active process on the joined process's joiners
+    // list (a singly-linked stack via SLOT_PROCESS_NEXT_LINK).
+    // processEntry walks the list in termination order and
+    // re-queues every joiner runnable.
+    object.setSlot(active, object.SLOT_PROCESS_STATE, vm.globals.sym_waiting);
+    const head = object.slot(recv_pin, object.SLOT_PROCESS_JOINERS);
+    object.setSlot(active, object.SLOT_PROCESS_NEXT_LINK, head);
+    object.setSlot(recv_pin, object.SLOT_PROCESS_JOINERS, active);
+
+    try vm.scheduleNext();
+    return object.slot(recv_pin, object.SLOT_PROCESS_RESULT);
 }
 
 // Processor>>yield — push the active Process to the back of its

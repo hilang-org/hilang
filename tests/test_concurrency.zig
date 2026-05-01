@@ -688,6 +688,123 @@ test "Process without onCrash: silently swallows the exception" {
     try std.testing.expectEqual(@as(i64, 42), vm.oop.toInt(got));
 }
 
+test "Process>>join blocks until the worker terminates and returns its result" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    // p := [42] fork.   ^p join
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"literal":{"int":42}}
+        \\]}},"selector":"fork","args":[]}},"selector":"join","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 42), vm.oop.toInt(got));
+}
+
+test "Process>>join returns immediately if already terminated" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // p := [7] fork. Processor yield.   "p has finished"   ^p join
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"JP"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"block":{"params":[],"temps":[],"body":[{"literal":{"int":7}}]}},"selector":"fork","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Processor\"},\"selector\":\"yield\",\"args\":[]}}");
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"JP"},"selector":"join","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 7), vm.oop.toInt(got));
+}
+
+test "multiple joiners on the same Process all wake on termination" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // Worker that semaphore-waits, so it doesn't terminate
+    // until main releases it.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"JS"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Semaphore"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"JLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"Worker"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"JS"},"selector":"wait","args":[]}},
+        \\    {"literal":{"int":99}}
+        \\  ]}},"selector":"fork","args":[]}}
+        \\]}}
+    );
+
+    // Two joiner forks that both join on Worker and log the result.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"JLog"},"selector":"addLast:","args":[
+        \\    {"send":{"receiver":{"var_ref":"Worker"},"selector":"join","args":[]}}
+        \\  ]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"JLog"},"selector":"addLast:","args":[
+        \\    {"send":{"receiver":{"var_ref":"Worker"},"selector":"join","args":[]}}
+        \\  ]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    // Yield until both joiners are parked, then signal Worker
+    // to release; both joiners should wake with result=99.
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Processor\"},\"selector\":\"yield\",\"args\":[]}}");
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Processor\"},\"selector\":\"yield\",\"args\":[]}}");
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"JS\"},\"selector\":\"signal\",\"args\":[]}}");
+    var i: u32 = 0;
+    while (i < 6) : (i += 1) {
+        _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Processor\"},\"selector\":\"yield\",\"args\":[]}}");
+    }
+
+    const sz = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"JLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 2), vm.oop.toInt(sz));
+    const a = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"JLog"},"selector":"at:","args":[{"literal":{"int":1}}]}}
+    );
+    const b = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"JLog"},"selector":"at:","args":[{"literal":{"int":2}}]}}
+    );
+    try std.testing.expectEqual(@as(i64, 99), vm.oop.toInt(a));
+    try std.testing.expectEqual(@as(i64, 99), vm.oop.toInt(b));
+}
+
+test "Process>>join on self raises PrimitiveFailed" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // Force lazy main-process creation so `activeProcess` is
+    // not nil when we try to join it. A bare yield is enough.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+    );
+    // (Processor activeProcess) join — main joining itself.
+    const result = env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"Processor"},"selector":"activeProcess","args":[]}},
+        \\  "selector":"join","args":[]}}
+    );
+    try std.testing.expectError(error.PrimitiveFailed, result);
+}
+
 test "Terminated processes are reaped from the Vm's process list" {
     // Without the reaper, every fork leaves a dangling Process oop
     // on Vm.all_processes (and a 2 MiB mmap'd stack on

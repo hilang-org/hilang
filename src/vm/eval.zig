@@ -401,6 +401,7 @@ pub const Vm = struct {
         object.setSlot(main, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(0));
         object.setSlot(main, object.SLOT_PROCESS_WAIT_DEADLINE, oop_mod.fromInt(0));
         object.setSlot(main, object.SLOT_PROCESS_ON_CRASH, oop_mod.NIL);
+        object.setSlot(main, object.SLOT_PROCESS_JOINERS, oop_mod.NIL);
         var main_pin: Oop = main;
         var slots: [1]?*Oop = .{&main_pin};
         var pin = RootPin{ .parent = self.root_pin, .slots = &slots, .n = 1 };
@@ -2023,6 +2024,20 @@ fn processEntry(arg: ?*anyopaque) callconv(.c) noreturn {
     }
     object.setSlot(proc, object.SLOT_PROCESS_RESULT, result);
     object.setSlot(proc, object.SLOT_PROCESS_STATE, vm.globals.sym_terminated);
+
+    // Wake any green threads parked in `Process>>join` against
+    // this process. Each joiner is unlinked from the chain,
+    // marked runnable, and pushed onto its priority's run
+    // queue so the next scheduling round picks it up.
+    var joiner = object.slot(proc, object.SLOT_PROCESS_JOINERS);
+    while (oop_mod.isHeapPtr(joiner)) {
+        const next = object.slot(joiner, object.SLOT_PROCESS_NEXT_LINK);
+        object.setSlot(joiner, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+        object.setSlot(joiner, object.SLOT_PROCESS_STATE, vm.globals.sym_runnable);
+        vm.enqueueRunnable(joiner);
+        joiner = next;
+    }
+    object.setSlot(proc, object.SLOT_PROCESS_JOINERS, oop_mod.NIL);
     // Find someone to hand the host thread back to. If the runnable
     // list is empty, every other Process has finished too — but the
     // host's main Process is special-cased: it's not on the runnable
