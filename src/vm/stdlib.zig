@@ -2350,7 +2350,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
             "priority", "state",     "block",      "name",
             "nextLink", "result",    "suspendedContext",
             "savedFrame", "savedMethodFrame", "savedMethodClass",
-            "deadline", "waitFd", "waitEvent",
+            "deadline", "waitFd", "waitEvent", "waitDeadline",
         },
     );
     g.process_class = process_class;
@@ -2719,9 +2719,15 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
 
     // Class-side factories.
     const sock_meta = object.headerOf(socket_class).class;
+    // connectTo:port: defaults to "wait forever" by passing 0 ms.
     try defineMethod(c, sock_meta, "connectTo:port:", &.{ "aHost", "aPort" }, &.{}, &.{
-        try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "primConnect:port:", &.{
-            try varRef(c, "aHost"), try varRef(c, "aPort"),
+        try ret(c, try send(c, try varRef(c, "self"), "connectTo:port:timeout:", &.{
+            try varRef(c, "aHost"), try varRef(c, "aPort"), try litInt(c, 0),
+        })),
+    });
+    try defineMethod(c, sock_meta, "connectTo:port:timeout:", &.{ "aHost", "aPort", "aTimeoutMs" }, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "new", &.{}), "primConnect:port:timeoutMs:", &.{
+            try varRef(c, "aHost"), try varRef(c, "aPort"), try varRef(c, "aTimeoutMs"),
         })),
     });
     try defineMethod(c, sock_meta, "listenOn:", &.{"aPort"}, &.{}, &.{

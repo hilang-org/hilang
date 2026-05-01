@@ -390,7 +390,7 @@ pub fn bootstrap(heap: *Heap) !Globals {
     // read/write/close primitives reuse the FileStream prim
     // functions; only connect/listen/accept are net-specific.
     if (oop_mod.isHeapPtr(g.socket_class)) {
-        try installPrim(heap, &g, g.socket_class, "primConnect:port:", 2, prims.PRIM_SOCK_CONNECT);
+        try installPrim(heap, &g, g.socket_class, "primConnect:port:timeoutMs:", 3, prims.PRIM_SOCK_CONNECT);
         try installPrim(heap, &g, g.socket_class, "primListen:", 1, prims.PRIM_SOCK_LISTEN);
         try installPrim(heap, &g, g.socket_class, "accept", 0, prims.PRIM_SOCK_ACCEPT);
         try installPrim(heap, &g, g.socket_class, "read:", 1, prims.PRIM_FS_READ);

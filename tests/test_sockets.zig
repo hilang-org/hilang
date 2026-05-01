@@ -95,7 +95,7 @@ test "connect to a closed port raises PrimitiveFailed" {
         \\  {"literal":{"string":"127.0.0.1"}},{"literal":{"int":1}}
         \\]}}
     );
-    try std.testing.expectError(error.PrimitiveFailed, result);
+    try std.testing.expectError(error.UserSignal, result);
 }
 
 test "DNS hostname resolves through getaddrinfo" {
@@ -131,6 +131,55 @@ test "DNS hostname resolves through getaddrinfo" {
     _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"DnsServer\"},\"selector\":\"close\",\"args\":[]}}");
 }
 
+test "connect refusal surfaces a Smalltalk Exception with messageText" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // [Socket connectTo: '127.0.0.1' port: 1] on: Exception do: [:e | e messageText]
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"Socket"},"selector":"connectTo:port:","args":[
+        \\    {"literal":{"string":"127.0.0.1"}},{"literal":{"int":1}}
+        \\  ]}}
+        \\]}},"selector":"on:do:","args":[
+        \\  {"var_ref":"Exception"},
+        \\  {"block":{"params":["e"],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"e"},"selector":"messageText","args":[]}}
+        \\  ]}}
+        \\]}}
+    );
+    try std.testing.expect(vm.oop.isHeapPtr(got));
+    const bytes = vm.object.bytesOf(got)[0..vm.object.headerOf(got).size];
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "connect:"));
+}
+
+test "connectTo:port:timeout: surfaces 'connect: timed out' on a black hole" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // 198.51.100.1 is in TEST-NET-2 (RFC 5737) — guaranteed to
+    // not respond. With a 100ms timeout the connect should
+    // surface a timeout exception rather than waiting on TCP's
+    // ~75s default SYN retry budget.
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"Socket"},"selector":"connectTo:port:timeout:","args":[
+        \\    {"literal":{"string":"198.51.100.1"}},{"literal":{"int":80}},{"literal":{"int":100}}
+        \\  ]}}
+        \\]}},"selector":"on:do:","args":[
+        \\  {"var_ref":"Exception"},
+        \\  {"block":{"params":["e"],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"e"},"selector":"messageText","args":[]}}
+        \\  ]}}
+        \\]}}
+    );
+    try std.testing.expect(vm.oop.isHeapPtr(got));
+    try std.testing.expectEqualStrings(
+        "connect: timed out",
+        vm.object.bytesOf(got)[0..vm.object.headerOf(got).size],
+    );
+}
+
 test "garbage hostname still raises PrimitiveFailed" {
     var env: TestEnv = undefined;
     try env.init();
@@ -140,5 +189,5 @@ test "garbage hostname still raises PrimitiveFailed" {
         \\  {"literal":{"string":"this.is.not.a.real.tld.zzz.invalid"}},{"literal":{"int":80}}
         \\]}}
     );
-    try std.testing.expectError(error.PrimitiveFailed, result);
+    try std.testing.expectError(error.UserSignal, result);
 }

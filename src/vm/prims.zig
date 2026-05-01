@@ -1431,6 +1431,7 @@ fn newProcess(vm: *Vm, block: Oop, priority: i64) PrimError!Oop {
     object.setSlot(p, object.SLOT_PROCESS_DEADLINE, oop_mod.fromInt(0));
     object.setSlot(p, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-1));
     object.setSlot(p, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(0));
+    object.setSlot(p, object.SLOT_PROCESS_WAIT_DEADLINE, oop_mod.fromInt(0));
     return p;
 }
 
@@ -1653,17 +1654,56 @@ fn buildSockaddrIn(port: u16) std.posix.sockaddr.in {
     };
 }
 
-// Socket>>primConnect: aHost port: aPort
+// Allocate an Exception with `messageText := msg` and stash it
+// as the in-flight signaled exception so the caller can
+// `return error.UserSignal`. Caller must check that the
+// exception class is non-NIL — without it we have no class to
+// allocate against and surface a plain PrimitiveFailed instead.
+fn signalSmalltalkError(vm: *Vm, msg: []const u8) PrimError!Oop {
+    if (!oop_mod.isHeapPtr(vm.globals.exception_class)) return error.PrimitiveFailed;
+    const text = vm.heap.allocBytes(vm.globals.string_class, @intCast(msg.len)) catch return error.OutOfMemory;
+    if (msg.len > 0) @memcpy(object.bytesOf(text)[0..msg.len], msg);
+    var text_pin: Oop = text;
+    var slot_ptrs: [1]?*Oop = .{&text_pin};
+    var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 1 };
+    vm.root_pin = &pin;
+    defer vm.root_pin = pin.parent;
+    const exc = vm.heap.allocSlots(vm.globals.exception_class, object.EXCEPTION_INST_SIZE) catch return error.OutOfMemory;
+    object.setSlot(exc, object.SLOT_EXCEPTION_MESSAGE, text_pin);
+    vm.signaled_exception = exc;
+    return error.UserSignal;
+}
+
+fn errnoConnectMessage(e: std.posix.E) []const u8 {
+    return switch (e) {
+        .CONNREFUSED => "connect: connection refused",
+        .TIMEDOUT => "connect: timed out",
+        .HOSTUNREACH => "connect: host unreachable",
+        .NETUNREACH => "connect: network unreachable",
+        .ADDRNOTAVAIL => "connect: address not available",
+        .ACCES, .PERM => "connect: permission denied",
+        else => "connect: failed",
+    };
+}
+
+// Socket>>primConnect: aHost port: aPort timeoutMs: aTimeout
 //   aHost may be an IPv4 literal, an IPv6 literal, or a DNS
 //   hostname; getaddrinfo handles all three. Walks the result
 //   list trying socket()+connect() for each addrinfo until one
-//   succeeds. Stores the fd into receiver's slot 0; returns
-//   receiver so chains compose.
+//   succeeds. The socket is set to non-blocking *before* connect
+//   so we don't freeze the host thread; on EINPROGRESS we park
+//   on the writability poller event with the supplied timeout
+//   (0 = wait forever) and SO_ERROR-check on wake. On any
+//   terminal failure (DNS miss, all addresses refused, timeout)
+//   signal a Smalltalk Exception so user code can `on:do:`
+//   instead of catching a Zig PrimitiveFailed.
 fn primSockConnect(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
-    if (args.len != 2) return error.ArityMismatch;
+    if (args.len != 3) return error.ArityMismatch;
     if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
     if (!oop_mod.isHeapPtr(args[0])) return error.TypeError;
     if (!oop_mod.isInt(args[1])) return error.TypeError;
+    if (!oop_mod.isInt(args[2])) return error.TypeError;
+    const timeout_ms = oop_mod.toInt(args[2]);
     const host_hdr = object.headerOf(args[0]);
     if ((host_hdr.flags & object.FLAG_BYTES) == 0) return error.TypeError;
     const host_bytes = object.bytesOf(args[0])[0..host_hdr.size];
@@ -1690,12 +1730,15 @@ fn primSockConnect(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
 
     var res: ?*std.posix.system.addrinfo = null;
     const eai = std.posix.system.getaddrinfo(host_z, port_z, &hints, &res);
-    if (@intFromEnum(eai) != 0) return error.PrimitiveFailed;
+    if (@intFromEnum(eai) != 0) return signalSmalltalkError(vm, "connect: host not found");
     defer if (res) |r| std.posix.system.freeaddrinfo(r);
 
-    // Try each result in order. accept() can fail for
-    // various reasons (unsupported family, refused connection);
-    // continue to the next addrinfo before giving up.
+    // Track the last meaningful errno across addrinfo attempts
+    // so the failure exception's messageText points at the
+    // proximate cause rather than a generic "failed".
+    var last_err: std.posix.E = .CONNREFUSED;
+    var saw_timeout = false;
+
     var ai_opt: ?*std.posix.system.addrinfo = res;
     while (ai_opt) |ai| : (ai_opt = ai.next) {
         const fd = std.posix.system.socket(@intCast(ai.family), @intCast(ai.socktype), @intCast(ai.protocol));
@@ -1716,10 +1759,21 @@ fn primSockConnect(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
             const e = std.posix.errno(rc);
             switch (e) {
                 .INPROGRESS, .ALREADY => {
-                    vm.waitForFd(@intCast(fd), 1) catch {
+                    const ready = vm.waitForFdWithTimeout(@intCast(fd), 1, timeout_ms) catch {
                         _ = std.posix.system.close(fd);
+                        last_err = .CONNREFUSED;
                         continue;
                     };
+                    if (!ready) {
+                        // Deadline elapsed before the kernel
+                        // reported writability. Walk to the next
+                        // addrinfo, but remember a timeout
+                        // happened so the final exception text
+                        // is informative.
+                        _ = std.posix.system.close(fd);
+                        saw_timeout = true;
+                        continue;
+                    }
                     // Connect either completed or failed; check
                     // SO_ERROR to distinguish. Non-zero means try
                     // the next addrinfo.
@@ -1728,12 +1782,14 @@ fn primSockConnect(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
                     const got = std.posix.system.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&sock_err), &so_len);
                     if (got != 0 or sock_err != 0) {
                         _ = std.posix.system.close(fd);
+                        if (sock_err != 0) last_err = @enumFromInt(sock_err);
                         continue;
                     }
                 },
                 .ISCONN => {}, // Already connected — proceed.
                 else => {
                     _ = std.posix.system.close(fd);
+                    last_err = e;
                     continue;
                 },
             }
@@ -1741,7 +1797,8 @@ fn primSockConnect(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
         object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
         return receiver;
     }
-    return error.PrimitiveFailed;
+    if (saw_timeout) return signalSmalltalkError(vm, "connect: timed out");
+    return signalSmalltalkError(vm, errnoConnectMessage(last_err));
 }
 
 // Socket>>primListen: aPort  — bind to 0.0.0.0:aPort with

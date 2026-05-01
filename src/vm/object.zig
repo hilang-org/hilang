@@ -212,10 +212,16 @@ pub const SLOT_PROCESS_SAVED_METHOD_CLASS: u32 = 9;
 pub const SLOT_PROCESS_DEADLINE: u32 = 10;
 // File descriptor and event (0 = read, 1 = write) when this
 // process is parked on the scheduler's io-wait list. -1 means
-// not waiting on any fd.
+// not waiting on any fd; -2 is a sentinel set by the timeout
+// path so the prim can distinguish "fd ready" from "timed out".
 pub const SLOT_PROCESS_WAIT_FD: u32 = 11;
 pub const SLOT_PROCESS_WAIT_EVENT: u32 = 12;
-pub const PROCESS_INST_SIZE: u32 = 13;
+// Optional monotonic-nanos deadline for the io wait (0 = no
+// timeout). The scheduler walks io waiters' deadlines when
+// computing the kqueue/epoll timeout, and expires any whose
+// deadline has elapsed by setting wait_fd to -2.
+pub const SLOT_PROCESS_WAIT_DEADLINE: u32 = 13;
+pub const PROCESS_INST_SIZE: u32 = 14;
 
 // Semaphore { count, waitersHead, waitersTail }
 //   count        — SmallInt; signal increments, wait decrements when > 0.

@@ -399,6 +399,7 @@ pub const Vm = struct {
         object.setSlot(main, object.SLOT_PROCESS_DEADLINE, oop_mod.fromInt(0));
         object.setSlot(main, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-1));
         object.setSlot(main, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(0));
+        object.setSlot(main, object.SLOT_PROCESS_WAIT_DEADLINE, oop_mod.fromInt(0));
         var main_pin: Oop = main;
         var slots: [1]?*Oop = .{&main_pin};
         var pin = RootPin{ .parent = self.root_pin, .slots = &slots, .n = 1 };
@@ -622,6 +623,13 @@ pub const Vm = struct {
     /// subscription, and yield. Returns when `expireIoWaiters`
     /// observes the event and re-queues us as runnable.
     pub fn waitForFd(self: *Vm, fd: i32, event: u8) !void {
+        _ = try self.waitForFdWithTimeout(fd, event, 0);
+    }
+
+    /// Like `waitForFd`, but with an optional millisecond timeout.
+    /// Returns true if the fd became ready, false if the timeout
+    /// elapsed first. `timeout_ms == 0` means "wait forever".
+    pub fn waitForFdWithTimeout(self: *Vm, fd: i32, event: u8, timeout_ms: i64) !bool {
         const p = try self.ensurePoller();
         try pollerArmOnce(p, fd, event);
 
@@ -630,8 +638,19 @@ pub const Vm = struct {
         object.setSlot(active, object.SLOT_PROCESS_STATE, self.globals.sym_waiting);
         object.setSlot(active, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(fd));
         object.setSlot(active, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(@intCast(event)));
+        const deadline: i64 = if (timeout_ms > 0) monotonicNanos() + timeout_ms * std.time.ns_per_ms else 0;
+        object.setSlot(active, object.SLOT_PROCESS_WAIT_DEADLINE, oop_mod.fromInt(deadline));
         self.ioWaitEnqueue(active);
         try self.scheduleNext();
+        // After wake, the wait_fd slot tells us how we got out:
+        // -1 means the poller fired (fd ready); -2 means the
+        // scheduler's timeout walk fired (deadline elapsed).
+        const wf_oop = object.slot(active, object.SLOT_PROCESS_WAIT_FD);
+        const wf = if (oop_mod.isInt(wf_oop)) oop_mod.toInt(wf_oop) else -1;
+        // Reset the slot so later prim calls start fresh.
+        object.setSlot(active, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-1));
+        object.setSlot(active, object.SLOT_PROCESS_WAIT_DEADLINE, oop_mod.fromInt(0));
+        return wf != -2;
     }
 
     /// Push `process` on the I/O-wait list. Order is irrelevant —
@@ -646,8 +665,8 @@ pub const Vm = struct {
         object.setSlot(sched, object.SLOT_SCHEDULER_IO_HEAD, process);
     }
 
-    /// Drain ready events from the poller and re-queue any process
-    /// whose waitFd matches a ready event. Caller passes `null`
+    /// Drain ready events from the poller, then expire any waiter
+    /// whose wait_deadline has elapsed. Caller passes `null`
     /// timeout to block until something becomes ready, or `0` to
     /// poll without blocking.
     pub fn expireIoWaiters(self: *Vm, timeout_ns: ?i64) void {
@@ -685,6 +704,57 @@ pub const Vm = struct {
                 cur = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
             }
         }
+
+        // Timeout sweep: any waiter whose deadline has elapsed
+        // gets a -2 sentinel in wait_fd so the prim that called
+        // waitForFdWithTimeout knows it timed out (vs the poller
+        // having fired with -1).
+        const now = monotonicNanos();
+        var prev: Oop = oop_mod.NIL;
+        var cur = object.slot(sched, object.SLOT_SCHEDULER_IO_HEAD);
+        while (oop_mod.isHeapPtr(cur)) {
+            const dl_oop = object.slot(cur, object.SLOT_PROCESS_WAIT_DEADLINE);
+            const has_dl = oop_mod.isInt(dl_oop) and oop_mod.toInt(dl_oop) > 0;
+            if (has_dl and oop_mod.toInt(dl_oop) <= now) {
+                const next = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+                if (oop_mod.isNil(prev)) {
+                    object.setSlot(sched, object.SLOT_SCHEDULER_IO_HEAD, next);
+                } else {
+                    object.setSlot(prev, object.SLOT_PROCESS_NEXT_LINK, next);
+                }
+                object.setSlot(cur, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+                object.setSlot(cur, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-2));
+                object.setSlot(cur, object.SLOT_PROCESS_STATE, self.globals.sym_runnable);
+                self.enqueueRunnable(cur);
+                cur = next;
+                continue;
+            }
+            prev = cur;
+            cur = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+        }
+    }
+
+    /// Walk the io-wait list and return the smallest non-zero
+    /// wait_deadline (in monotonic nanos), or 0 if no waiter has
+    /// a timeout. Used by scheduleNext to bound its kqueue/epoll
+    /// blocking-wait so a timed-out waiter doesn't get stuck
+    /// waiting forever for a poller event that never comes.
+    fn earliestIoDeadline(self: *Vm) i64 {
+        const sched = self.globals.processor;
+        if (!oop_mod.isHeapPtr(sched)) return 0;
+        var earliest: i64 = 0;
+        var cur = object.slot(sched, object.SLOT_SCHEDULER_IO_HEAD);
+        while (oop_mod.isHeapPtr(cur)) {
+            const dl_oop = object.slot(cur, object.SLOT_PROCESS_WAIT_DEADLINE);
+            if (oop_mod.isInt(dl_oop)) {
+                const dl = oop_mod.toInt(dl_oop);
+                if (dl > 0 and (earliest == 0 or dl < earliest)) {
+                    earliest = dl;
+                }
+            }
+            cur = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+        }
+        return earliest;
     }
 
     /// Move every sleeping process whose deadline has passed off
@@ -810,16 +880,26 @@ pub const Vm = struct {
             const have_io = oop_mod.isHeapPtr(io_head);
             if (!have_delay and !have_io) break;
 
-            // Compute poller timeout in nanoseconds, bounded by
-            // delay deadline if any sleeper has one. `null` means
-            // block forever (only when io wait list non-empty).
+            // Compute poller timeout in nanoseconds. We cap the
+            // wait at min(delay deadline, earliest io waiter
+            // deadline) so a sleeper or a timed-out io-waiter
+            // can't get stuck behind an indefinite kqueue/epoll
+            // wait. `null` means block forever (no deadlines
+            // anywhere; only safe when io wait list is non-empty).
             var timeout_ns: ?i64 = null;
+            const now_ns = monotonicNanos();
             if (have_delay) {
                 const dl_oop = object.slot(delay_head, object.SLOT_PROCESS_DEADLINE);
                 if (oop_mod.isInt(dl_oop)) {
-                    const delta = oop_mod.toInt(dl_oop) - monotonicNanos();
+                    const delta = oop_mod.toInt(dl_oop) - now_ns;
                     timeout_ns = if (delta > 0) delta else 0;
                 }
+            }
+            const io_dl = self.earliestIoDeadline();
+            if (io_dl > 0) {
+                const io_delta = io_dl - now_ns;
+                const io_to: i64 = if (io_delta > 0) io_delta else 0;
+                timeout_ns = if (timeout_ns) |t| @min(t, io_to) else io_to;
             }
 
             if (have_io) {
