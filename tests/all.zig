@@ -19,4 +19,5 @@ comptime {
     _ = @import("test_http.zig");
     _ = @import("test_datetime.zig");
     _ = @import("test_nonblocking.zig");
+    _ = @import("test_random.zig");
 }

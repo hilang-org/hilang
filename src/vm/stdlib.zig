@@ -3003,4 +3003,67 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
     try defineMethod(c, dt_meta, "now", &.{}, &.{}, &.{
         try ret(c, try send(c, try varRef(c, "self"), "primNow", &.{})),
     });
+
+    // ---- Random ----
+    //
+    // xorshift64* PRNG. State is two SmallInt ivars (32 bits
+    // each — stateLo at slot 0 and stateHi at slot 1) so 64-bit
+    // operations round-trip through SmallInt without overflow.
+    // Suitable for non-cryptographic sampling, shuffling, and
+    // procedural generation; not for keys.
+    const random_class = try defineClassAndRegister(
+        heap,
+        g,
+        "Random",
+        g.object_class,
+        &.{ "stateLo", "stateHi" },
+    );
+
+    // Random>>initSeed: anInt
+    //   | s |
+    //   s := anInt = 0 ifTrue: [1] ifFalse: [anInt abs].
+    //   stateLo := s \\ 4294967296.
+    //   stateHi := s // 4294967296.
+    //   ^self
+    try defineMethod(c, random_class, "initSeed:", &.{"anInt"}, &.{"s"}, &.{
+        try assignNode(c, "s", try send(c, try send(c, try varRef(c, "anInt"), "=", &.{try litInt(c, 0)}), "ifTrue:ifFalse:", &.{
+            try block(c, &.{}, &.{}, &.{try litInt(c, 1)}),
+            try block(c, &.{}, &.{}, &.{try send(c, try varRef(c, "anInt"), "abs", &.{})}),
+        })),
+        try assignNode(c, "stateLo", try send(c, try varRef(c, "s"), "\\\\", &.{try litInt(c, 4_294_967_296)})),
+        try assignNode(c, "stateHi", try send(c, try varRef(c, "s"), "//", &.{try litInt(c, 4_294_967_296)})),
+        try ret(c, try varRef(c, "self")),
+    });
+
+    // Random>>initRandomly  ^self initSeed: Time monotonicNanos
+    try defineMethod(c, random_class, "initRandomly", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "initSeed:", &.{
+            try send(c, try varRef(c, "Time"), "monotonicNanos", &.{}),
+        })),
+    });
+
+    // Random>>next — Float in [0, 1). 2^60 is exact-enough as a
+    // Float divisor for non-crypto use (small precision loss in
+    // the low bits is irrelevant for sampling/shuffling).
+    try defineMethod(c, random_class, "next", &.{}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try send(c, try varRef(c, "self"), "nextRawInt", &.{}), "asFloat", &.{}), "/", &.{
+            try litInt(c, 1152921504606846976),
+        })),
+    });
+    try defineMethod(c, random_class, "nextInteger:", &.{"bound"}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try varRef(c, "self"), "nextRawInt", &.{}), "\\\\", &.{try varRef(c, "bound")})),
+    });
+    try defineMethod(c, random_class, "nextBoolean", &.{}, &.{}, &.{
+        try ret(c, try send(c, try send(c, try send(c, try varRef(c, "self"), "nextRawInt", &.{}), "\\\\", &.{try litInt(c, 2)}), "=", &.{try litInt(c, 0)})),
+    });
+
+    // Class side: `Random new` is auto-seeded from the wall
+    // clock; `Random seed: anInt` is the deterministic alternative.
+    const rand_meta = object.headerOf(random_class).class;
+    try defineMethod(c, rand_meta, "new", &.{}, &.{}, &.{
+        try ret(c, try send(c, try superSend(c, "new", &.{}), "initRandomly", &.{})),
+    });
+    try defineMethod(c, rand_meta, "seed:", &.{"anInt"}, &.{}, &.{
+        try ret(c, try send(c, try superSend(c, "new", &.{}), "initSeed:", &.{try varRef(c, "anInt")})),
+    });
 }

@@ -139,6 +139,7 @@ pub const PRIM_STRING_TRIMMED: u32 = 355;
 pub const PRIM_STRING_ENDS_WITH: u32 = 356;
 pub const PRIM_STRING_AS_INTEGER: u32 = 357;
 pub const PRIM_DATETIME_NOW: u32 = 360;
+pub const PRIM_RANDOM_NEXT: u32 = 370;
 
 pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimError!Oop {
     return switch (prim_id) {
@@ -257,6 +258,7 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_STRING_ENDS_WITH => primStringEndsWith(vm, receiver, args),
         PRIM_STRING_AS_INTEGER => primStringAsInteger(vm, receiver, args),
         PRIM_DATETIME_NOW => primDateTimeNow(vm, receiver, args),
+        PRIM_RANDOM_NEXT => primRandomNext(vm, receiver, args),
         else => error.UnknownPrimitive,
     };
 }
@@ -1021,6 +1023,41 @@ fn primStringStartsWith(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop 
     const r_bytes = object.bytesOf(receiver)[0..r_hdr.size];
     const p_bytes = object.bytesOf(args[0])[0..p_hdr.size];
     return oop_mod.fromBool(std.mem.startsWith(u8, r_bytes, p_bytes));
+}
+
+// Random>>primNext — advance the receiver's xorshift64* state
+// and return the next 60-bit positive SmallInt.
+//
+// State lives in two SmallInt ivars (slot 0 = stateLo, slot 1 =
+// stateHi) holding 32 bits each so a 64-bit u64 round-trips
+// through SmallInt without overflow. The xorshift64 step can't
+// escape from a zero state; we re-seed to 1 if the caller
+// somehow zeroed both halves. Output is masked to 60 bits so
+// it always fits in a positive SmallInt — Smalltalk-side `next`
+// divides by 2^60 to get a Float in [0, 1).
+fn primRandomNext(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
+    const lo_oop = object.slot(receiver, 0);
+    const hi_oop = object.slot(receiver, 1);
+    if (!oop_mod.isInt(lo_oop) or !oop_mod.isInt(hi_oop)) return error.TypeError;
+    const lo: u64 = @intCast(@as(i64, oop_mod.toInt(lo_oop)) & 0xFFFFFFFF);
+    const hi: u64 = @intCast(@as(i64, oop_mod.toInt(hi_oop)) & 0xFFFFFFFF);
+    var state: u64 = (hi << 32) | lo;
+    if (state == 0) state = 1;
+
+    // xorshift64 mix.
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    // *splat with a well-distributed odd constant for output
+    // (xorshift64* — Marsaglia 2003 + Vigna 2014).
+    const out: u64 = state *% 0x2545F4914F6CDD1D;
+
+    object.setSlot(receiver, 0, oop_mod.fromInt(@intCast(state & 0xFFFFFFFF)));
+    object.setSlot(receiver, 1, oop_mod.fromInt(@intCast((state >> 32) & 0xFFFFFFFF)));
+    const masked: u64 = out & ((@as(u64, 1) << 60) - 1);
+    return oop_mod.fromInt(@intCast(masked));
 }
 
 // DateTime class>>primNow — allocate a fresh DateTime instance

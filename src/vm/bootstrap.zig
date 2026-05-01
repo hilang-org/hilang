@@ -376,6 +376,11 @@ pub fn bootstrap(heap: *Heap) !Globals {
         try installPrim(heap, &g, dt_meta, "primNow", 0, prims.PRIM_DATETIME_NOW);
     }
 
+    const random_cls = dict_mod.lookup(g.smalltalk, "Random");
+    if (oop_mod.isHeapPtr(random_cls)) {
+        try installPrim(heap, &g, random_cls, "nextRawInt", 0, prims.PRIM_RANDOM_NEXT);
+    }
+
     // FileStream primitives. Receiver is a FileStream; slot 0 (`fd`)
     // is the underlying POSIX file descriptor.
     if (oop_mod.isHeapPtr(g.file_stream_class)) {
