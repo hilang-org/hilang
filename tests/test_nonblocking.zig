@@ -87,3 +87,74 @@ test "Socket server and client both run as green threads" {
         \\{"send":{"receiver":{"var_ref":"NbServer"},"selector":"close","args":[]}}
     );
 }
+
+test "non-blocking connect fans out without blocking the scheduler" {
+    // Pre-fix, connect() blocked the host thread synchronously
+    // until the 3-way handshake completed; with the listener
+    // already up that was instant on loopback so we never
+    // noticed. The new path sets O_NONBLOCK before connect, parks
+    // on writability via kqueue/epoll, and SO_ERROR-checks on
+    // wake — so multiple green threads can each be mid-connect
+    // without any of them freezing the scheduler.
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"FanCount"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"FanServer"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Socket"},"selector":"listenOn:","args":[{"literal":{"int":47932}}]}}
+        \\]}}
+    );
+
+    // One server worker that loops accepting & closing 5 clients.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":["i","c"],"body":[
+        \\  {"assign":{"name":"i","value":{"literal":{"int":0}}}},
+        \\  {"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"i"},"selector":"<","args":[{"literal":{"int":5}}]}}
+        \\  ]}},"selector":"whileTrue:","args":[{"block":{"params":[],"temps":[],"body":[
+        \\    {"assign":{"name":"c","value":{"send":{"receiver":{"var_ref":"FanServer"},"selector":"accept","args":[]}}}},
+        \\    {"send":{"receiver":{"var_ref":"c"},"selector":"close","args":[]}},
+        \\    {"assign":{"name":"i","value":{"send":{"receiver":{"var_ref":"i"},"selector":"+","args":[{"literal":{"int":1}}]}}}}
+        \\  ]}}]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+
+    // Five client workers, each independently connect+close. With
+    // a synchronous connect they'd serialise; with non-blocking
+    // they all fly out concurrently and the scheduler interleaves
+    // them with the server's accept.
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        _ = try env.evalJson(
+            \\{"send":{"receiver":{"block":{"params":[],"temps":["s"],"body":[
+            \\  {"assign":{"name":"s","value":{"send":{"receiver":{"var_ref":"Socket"},"selector":"connectTo:port:","args":[
+            \\    {"literal":{"string":"127.0.0.1"}},{"literal":{"int":47932}}
+            \\  ]}}}},
+            \\  {"send":{"receiver":{"var_ref":"s"},"selector":"close","args":[]}},
+            \\  {"send":{"receiver":{"var_ref":"FanCount"},"selector":"addLast:","args":[{"literal":{"int":1}}]}}
+            \\]}},"selector":"fork","args":[]}}
+        );
+    }
+
+    var y: u32 = 0;
+    while (y < 30) : (y += 1) {
+        _ = try env.evalJson(
+            \\{"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}}
+        );
+    }
+    const sz = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"FanCount"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 5), vm.oop.toInt(sz));
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"FanServer"},"selector":"close","args":[]}}
+    );
+}

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const oop_mod = @import("oop.zig");
 const object = @import("object.zig");
 const ast = @import("ast.zig");
@@ -448,8 +449,7 @@ pub const Vm = struct {
     /// any terminated processes' mmap stacks.
     fn dequeueHighestRunnable(self: *Vm) Oop {
         self.expireSleepers(monotonicNanos());
-        var zero_ts: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
-        self.expireIoWaiters(&zero_ts);
+        self.expireIoWaiters(0);
         self.reapTerminated();
         const sched = self.globals.processor;
         if (!oop_mod.isHeapPtr(sched)) return oop_mod.NIL;
@@ -509,34 +509,121 @@ pub const Vm = struct {
         object.setSlot(cur, object.SLOT_PROCESS_NEXT_LINK, process);
     }
 
-    /// Lazy-initialise the per-Vm kqueue used by waitForFd. -1
-    /// stays in `kq_fd` until first use, so VMs that never touch a
+    /// Lazy-initialise the per-Vm event poller used by waitForFd.
+    /// On macOS this is a kqueue fd; on Linux it's an epoll fd.
+    /// `kq_fd == -1` until first use so VMs that never touch a
     /// non-blocking fd don't pay for the syscall.
-    fn ensureKqueue(self: *Vm) !i32 {
+    fn ensurePoller(self: *Vm) !i32 {
         if (self.kq_fd >= 0) return self.kq_fd;
-        const fd = std.posix.system.kqueue();
-        if (fd < 0) return error.PrimitiveFailed;
+        const fd: i32 = switch (builtin.os.tag) {
+            .macos, .ios, .watchos, .tvos => blk: {
+                const f = std.posix.system.kqueue();
+                if (f < 0) return error.PrimitiveFailed;
+                break :blk f;
+            },
+            .linux => blk: {
+                const r: isize = @bitCast(std.os.linux.epoll_create1(0));
+                if (r < 0) return error.PrimitiveFailed;
+                break :blk @intCast(r);
+            },
+            else => @compileError("unsupported OS for non-blocking I/O"),
+        };
         self.kq_fd = fd;
         return fd;
     }
 
+    /// Register a one-shot subscription on `fd` for read (event=0)
+    /// or write (event=1). Implementation calls kqueue's `kevent`
+    /// or epoll's `epoll_ctl` depending on host OS. Returns an
+    /// error only on hard syscall failure.
+    fn pollerArmOnce(p: i32, fd: i32, event: u8) !void {
+        switch (builtin.os.tag) {
+            .macos, .ios, .watchos, .tvos => {
+                var change: std.posix.Kevent = .{
+                    .ident = @intCast(fd),
+                    .filter = if (event == 0) std.posix.system.EVFILT.READ else std.posix.system.EVFILT.WRITE,
+                    .flags = std.posix.system.EV.ADD | std.posix.system.EV.ONESHOT,
+                    .fflags = 0,
+                    .data = 0,
+                    .udata = 0,
+                };
+                var no_events: [0]std.posix.Kevent = undefined;
+                const rc = std.posix.system.kevent(p, @ptrCast(&change), 1, @ptrCast(&no_events), 0, null);
+                if (rc < 0) return error.PrimitiveFailed;
+            },
+            .linux => {
+                const linux = std.os.linux;
+                const ev_flag: u32 = @as(u32, if (event == 0) linux.EPOLL.IN else linux.EPOLL.OUT) | linux.EPOLL.ONESHOT;
+                var ev: linux.epoll_event = .{
+                    .events = ev_flag,
+                    .data = .{ .fd = fd },
+                };
+                // EPOLL_CTL_ADD fails with EEXIST if we re-arm an
+                // existing fd; fall back to MOD in that case rather
+                // than tracking which fds are already registered.
+                const r1: isize = @bitCast(linux.epoll_ctl(p, linux.EPOLL.CTL_ADD, fd, &ev));
+                if (r1 < 0) {
+                    const r2: isize = @bitCast(linux.epoll_ctl(p, linux.EPOLL.CTL_MOD, fd, &ev));
+                    if (r2 < 0) return error.PrimitiveFailed;
+                }
+            },
+            else => @compileError("unsupported OS for non-blocking I/O"),
+        }
+    }
+
+    /// Drain up to `out.len` ready fds into `out` with the given
+    /// timeout in nanoseconds. `null` timeout blocks forever; 0
+    /// is a non-blocking poll. Returns the number of events
+    /// collected (clamped to `out.len`).
+    fn pollerWait(p: i32, out: []i32, timeout_ns: ?i64) usize {
+        switch (builtin.os.tag) {
+            .macos, .ios, .watchos, .tvos => {
+                var events: [16]std.posix.Kevent = undefined;
+                const cap = @min(out.len, events.len);
+                var no_changes: [0]std.posix.Kevent = undefined;
+                var ts: std.posix.timespec = undefined;
+                var ts_ptr: ?*const std.posix.timespec = null;
+                if (timeout_ns) |t| {
+                    const clamped = if (t > 0) t else 0;
+                    ts = .{
+                        .sec = @intCast(@divTrunc(clamped, std.time.ns_per_s)),
+                        .nsec = @intCast(@mod(clamped, std.time.ns_per_s)),
+                    };
+                    ts_ptr = &ts;
+                }
+                const rc = std.posix.system.kevent(p, @ptrCast(&no_changes), 0, @ptrCast(&events), @intCast(cap), ts_ptr);
+                if (rc <= 0) return 0;
+                const n: usize = @intCast(rc);
+                var i: usize = 0;
+                while (i < n) : (i += 1) out[i] = @intCast(events[i].ident);
+                return n;
+            },
+            .linux => {
+                const linux = std.os.linux;
+                var events: [16]linux.epoll_event = undefined;
+                const cap = @min(out.len, events.len);
+                // epoll_wait timeout is signed milliseconds: -1 is
+                // infinite, 0 is poll.  Round up so a sub-ms
+                // timeout still blocks long enough for the event.
+                const ms: i32 = if (timeout_ns) |t| @intCast(@max(@as(i64, 0), @divTrunc(t + 999_999, 1_000_000))) else -1;
+                const r: isize = @bitCast(linux.epoll_wait(p, &events, @intCast(cap), ms));
+                if (r <= 0) return 0;
+                const n: usize = @intCast(r);
+                var i: usize = 0;
+                while (i < n) : (i += 1) out[i] = events[i].data.fd;
+                return n;
+            },
+            else => @compileError("unsupported OS for non-blocking I/O"),
+        }
+    }
+
     /// Park the active process on `fd`'s readability (event=0) or
-    /// writability (event=1), register a one-shot kqueue
+    /// writability (event=1), register a one-shot poller
     /// subscription, and yield. Returns when `expireIoWaiters`
     /// observes the event and re-queues us as runnable.
     pub fn waitForFd(self: *Vm, fd: i32, event: u8) !void {
-        const kq = try self.ensureKqueue();
-        var change: std.posix.Kevent = .{
-            .ident = @intCast(fd),
-            .filter = if (event == 0) std.posix.system.EVFILT.READ else std.posix.system.EVFILT.WRITE,
-            .flags = std.posix.system.EV.ADD | std.posix.system.EV.ONESHOT,
-            .fflags = 0,
-            .data = 0,
-            .udata = 0,
-        };
-        var no_events: [0]std.posix.Kevent = undefined;
-        const rc = std.posix.system.kevent(kq, @ptrCast(&change), 1, @ptrCast(&no_events), 0, null);
-        if (rc < 0) return error.PrimitiveFailed;
+        const p = try self.ensurePoller();
+        try pollerArmOnce(p, fd, event);
 
         try self.ensureMainProcess();
         const active = self.current_process;
@@ -548,8 +635,8 @@ pub const Vm = struct {
     }
 
     /// Push `process` on the I/O-wait list. Order is irrelevant —
-    /// kqueue is the source of truth for which fd is ready; the
-    /// list exists only so `expireIoWaiters` can find a process
+    /// the poller is the source of truth for which fd is ready;
+    /// the list exists only so `expireIoWaiters` can find a process
     /// by fd, and so the GC's slot walk keeps it alive.
     fn ioWaitEnqueue(self: *Vm, process: Oop) void {
         const sched = self.globals.processor;
@@ -559,25 +646,21 @@ pub const Vm = struct {
         object.setSlot(sched, object.SLOT_SCHEDULER_IO_HEAD, process);
     }
 
-    /// Drain ready events from kqueue with the given timeout. For
-    /// each ready fd, find the process parked on it, unlink from
-    /// the io list, and re-queue it as runnable. Caller passes
-    /// `null` timeout to block until something becomes ready, or
-    /// a `&zero_ts` to poll without blocking.
-    pub fn expireIoWaiters(self: *Vm, timeout: ?*const std.posix.timespec) void {
+    /// Drain ready events from the poller and re-queue any process
+    /// whose waitFd matches a ready event. Caller passes `null`
+    /// timeout to block until something becomes ready, or `0` to
+    /// poll without blocking.
+    pub fn expireIoWaiters(self: *Vm, timeout_ns: ?i64) void {
         if (self.kq_fd < 0) return;
         const sched = self.globals.processor;
         if (!oop_mod.isHeapPtr(sched)) return;
         if (oop_mod.isNil(object.slot(sched, object.SLOT_SCHEDULER_IO_HEAD))) return;
 
-        var events: [16]std.posix.Kevent = undefined;
-        var no_changes: [0]std.posix.Kevent = undefined;
-        const rc = std.posix.system.kevent(self.kq_fd, @ptrCast(&no_changes), 0, @ptrCast(&events), @intCast(events.len), timeout);
-        if (rc <= 0) return;
-        const n: usize = @intCast(rc);
+        var ready_fds: [16]i32 = undefined;
+        const n = pollerWait(self.kq_fd, &ready_fds, timeout_ns);
         var k: usize = 0;
         while (k < n) : (k += 1) {
-            const ready_fd: i64 = @intCast(events[k].ident);
+            const ready_fd: i64 = @intCast(ready_fds[k]);
             // Linear walk of the io list to find the matching
             // process. The list is bounded by concurrent I/O depth
             // (typically tens), so O(n) is fine.
@@ -727,30 +810,25 @@ pub const Vm = struct {
             const have_io = oop_mod.isHeapPtr(io_head);
             if (!have_delay and !have_io) break;
 
-            // Compute kqueue timeout: bounded by delay deadline if
-            // any sleeper has one. `null` means block forever.
-            var ts: std.posix.timespec = undefined;
-            var ts_ptr: ?*const std.posix.timespec = null;
+            // Compute poller timeout in nanoseconds, bounded by
+            // delay deadline if any sleeper has one. `null` means
+            // block forever (only when io wait list non-empty).
+            var timeout_ns: ?i64 = null;
             if (have_delay) {
                 const dl_oop = object.slot(delay_head, object.SLOT_PROCESS_DEADLINE);
                 if (oop_mod.isInt(dl_oop)) {
                     const delta = oop_mod.toInt(dl_oop) - monotonicNanos();
-                    const clamped = if (delta > 0) delta else 0;
-                    ts = .{
-                        .sec = @intCast(@divTrunc(clamped, std.time.ns_per_s)),
-                        .nsec = @intCast(@mod(clamped, std.time.ns_per_s)),
-                    };
-                    ts_ptr = &ts;
+                    timeout_ns = if (delta > 0) delta else 0;
                 }
             }
 
             if (have_io) {
-                self.expireIoWaiters(ts_ptr);
+                self.expireIoWaiters(timeout_ns);
             } else {
                 // Pure-sleep path: keep the existing nanosleep so
-                // we don't pay for a kqueue init on programs that
+                // we don't pay for a poller init on programs that
                 // only use Delay.
-                if (ts_ptr) |p| nanosleepFor(@as(i64, @intCast(p.sec)) * std.time.ns_per_s + @as(i64, @intCast(p.nsec)));
+                if (timeout_ns) |t| nanosleepFor(t);
             }
             next = self.dequeueHighestRunnable();
         }

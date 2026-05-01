@@ -1659,7 +1659,7 @@ fn buildSockaddrIn(port: u16) std.posix.sockaddr.in {
 //   list trying socket()+connect() for each addrinfo until one
 //   succeeds. Stores the fd into receiver's slot 0; returns
 //   receiver so chains compose.
-fn primSockConnect(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
+fn primSockConnect(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     if (args.len != 2) return error.ArityMismatch;
     if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
     if (!oop_mod.isHeapPtr(args[0])) return error.TypeError;
@@ -1704,15 +1704,42 @@ fn primSockConnect(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
             _ = std.posix.system.close(fd);
             continue;
         };
-        if (std.posix.system.connect(fd, addr, ai.addrlen) == 0) {
-            // Connect blocked through to completion; switch to
-            // non-blocking now so subsequent read/write yield to
-            // the scheduler instead of freezing the host thread.
-            setNonblock(fd);
-            object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
-            return receiver;
+        // Switch to non-blocking BEFORE connect so the syscall
+        // returns immediately (with EINPROGRESS) instead of
+        // freezing the host thread on slow / dropped routes.
+        // We then park on writability via kqueue/epoll, just
+        // like read/write/accept do; meanwhile other green
+        // threads keep running.
+        setNonblock(fd);
+        const rc = std.posix.system.connect(fd, addr, ai.addrlen);
+        if (rc != 0) {
+            const e = std.posix.errno(rc);
+            switch (e) {
+                .INPROGRESS, .ALREADY => {
+                    vm.waitForFd(@intCast(fd), 1) catch {
+                        _ = std.posix.system.close(fd);
+                        continue;
+                    };
+                    // Connect either completed or failed; check
+                    // SO_ERROR to distinguish. Non-zero means try
+                    // the next addrinfo.
+                    var sock_err: c_int = 0;
+                    var so_len: std.posix.socklen_t = @sizeOf(c_int);
+                    const got = std.posix.system.getsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.ERROR, @ptrCast(&sock_err), &so_len);
+                    if (got != 0 or sock_err != 0) {
+                        _ = std.posix.system.close(fd);
+                        continue;
+                    }
+                },
+                .ISCONN => {}, // Already connected — proceed.
+                else => {
+                    _ = std.posix.system.close(fd);
+                    continue;
+                },
+            }
         }
-        _ = std.posix.system.close(fd);
+        object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
+        return receiver;
     }
     return error.PrimitiveFailed;
 }
