@@ -777,6 +777,90 @@ test "Array parallel:do: with count 0 returns an empty Array" {
     try std.testing.expectEqual(@as(i64, 0), vm.oop.toInt(got));
 }
 
+test "Array parallel:collect: fans out over a collection in source order" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    // | input results |
+    // input := OrderedCollection new init.
+    // input addLast: 10. addLast: 20. addLast: 30.
+    // results := Array parallel: input collect: [:x | x * 2].
+    // results = #(20 40 60).
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"PCin"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"PCin\"},\"selector\":\"addLast:\",\"args\":[{\"literal\":{\"int\":10}}]}}");
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"PCin\"},\"selector\":\"addLast:\",\"args\":[{\"literal\":{\"int\":20}}]}}");
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"PCin\"},\"selector\":\"addLast:\",\"args\":[{\"literal\":{\"int\":30}}]}}");
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"PCout"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Array"},"selector":"parallel:collect:","args":[
+        \\    {"var_ref":"PCin"},
+        \\    {"block":{"params":["x"],"temps":[],"body":[
+        \\      {"send":{"receiver":{"var_ref":"x"},"selector":"*","args":[{"literal":{"int":2}}]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}}
+    );
+
+    const expected = [_]i64{ 20, 40, 60 };
+    for (expected, 1..) |want, idx| {
+        var buf: [192]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"PCout\"}},\"selector\":\"at:\",\"args\":[{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{idx},
+        );
+        const got = try env.evalJson(json);
+        try std.testing.expectEqual(want, vm.oop.toInt(got));
+    }
+}
+
+test "Array parallel:collect: works on an Interval" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // Array parallel: (1 to: 4) collect: [:x | x * x] → #(1 4 9 16)
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"PCi"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Array"},"selector":"parallel:collect:","args":[
+        \\    {"send":{"receiver":{"literal":{"int":1}},"selector":"to:","args":[{"literal":{"int":4}}]}},
+        \\    {"block":{"params":["x"],"temps":[],"body":[
+        \\      {"send":{"receiver":{"var_ref":"x"},"selector":"*","args":[{"var_ref":"x"}]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}}
+    );
+    const expected = [_]i64{ 1, 4, 9, 16 };
+    for (expected, 1..) |want, idx| {
+        var buf: [192]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"PCi\"}},\"selector\":\"at:\",\"args\":[{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{idx},
+        );
+        const got = try env.evalJson(json);
+        try std.testing.expectEqual(want, vm.oop.toInt(got));
+    }
+}
+
+test "Array parallel:collect: on empty input returns an empty Array" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"Array"},"selector":"parallel:collect:","args":[
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}},
+        \\  {"block":{"params":["x"],"temps":[],"body":[{"var_ref":"x"}]}}
+        \\]}},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 0), vm.oop.toInt(got));
+}
+
 test "Process>>join blocks until the worker terminates and returns its result" {
     var env: TestEnv = undefined;
     try env.init();

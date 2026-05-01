@@ -3180,4 +3180,52 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
         }),
         try ret(c, try varRef(c, "results")),
     });
+
+    // ---- Array class>>parallel:collect: — fan-out over a collection ----
+    //
+    // Each element of `aCollection` gets its own green thread
+    // running `aBlock value: each`; results are returned as an
+    // Array in the source order. Works on any Collection that
+    // responds to do: and size — Array, OrderedCollection,
+    // Interval, SortedCollection.
+    //
+    // parallel: aCollection collect: aBlock
+    //   | n procs results i |
+    //   n := aCollection size.
+    //   procs := Array new: n.
+    //   results := Array new: n.
+    //   i := 1.
+    //   aCollection do: [:each |
+    //     procs at: i put: [aBlock value: each] fork.
+    //     i := i + 1].
+    //   1 to: n do: [:k |
+    //     results at: k put: (procs at: k) join].
+    //   ^results
+    try defineMethod(c, array_meta, "parallel:collect:", &.{ "aCollection", "aBlock" }, &.{ "n", "procs", "results", "i" }, &.{
+        try assignNode(c, "n", try send(c, try varRef(c, "aCollection"), "size", &.{})),
+        try assignNode(c, "procs", try send(c, try varRef(c, "Array"), "new:", &.{try varRef(c, "n")})),
+        try assignNode(c, "results", try send(c, try varRef(c, "Array"), "new:", &.{try varRef(c, "n")})),
+        try assignNode(c, "i", try litInt(c, 1)),
+        try send(c, try varRef(c, "aCollection"), "do:", &.{
+            try block(c, &.{"each"}, &.{}, &.{
+                try send(c, try varRef(c, "procs"), "at:put:", &.{
+                    try varRef(c, "i"),
+                    try send(c, try block(c, &.{}, &.{}, &.{
+                        try send(c, try varRef(c, "aBlock"), "value:", &.{try varRef(c, "each")}),
+                    }), "fork", &.{}),
+                }),
+                try assignNode(c, "i", try send(c, try varRef(c, "i"), "+", &.{try litInt(c, 1)})),
+            }),
+        }),
+        try send(c, try litInt(c, 1), "to:do:", &.{
+            try varRef(c, "n"),
+            try block(c, &.{"k"}, &.{}, &.{
+                try send(c, try varRef(c, "results"), "at:put:", &.{
+                    try varRef(c, "k"),
+                    try send(c, try send(c, try varRef(c, "procs"), "at:", &.{try varRef(c, "k")}), "join", &.{}),
+                }),
+            }),
+        }),
+        try ret(c, try varRef(c, "results")),
+    });
 }
