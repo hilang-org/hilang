@@ -38,6 +38,11 @@ pub const EvalError = error{
     // Vm.signaled_exception. Caught by Block>>on:do: when the class
     // matches.
     UserSignal,
+    // Sentinel raised by Exception>>retry from inside an on:do:
+    // handler. primBlockOnDo intercepts it and loops back to
+    // re-invoke the protected block. Escaping outside an
+    // on:do: is a programmer error and propagates as-is.
+    ExceptionRetry,
 };
 
 pub const OutputSink = struct {

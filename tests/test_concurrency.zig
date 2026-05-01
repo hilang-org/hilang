@@ -419,6 +419,92 @@ test "suspended Process survives GC during another's run" {
     try std.testing.expectEqual(@as(i64, 5), vm.oop.toInt(got));
 }
 
+test "Mutex tryCritical: returns nil when held by another process" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"TM"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Mutex"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"TLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+
+    // Worker A holds the mutex across a yield.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"TM"},"selector":"critical:","args":[
+        \\    {"block":{"params":[],"temps":[],"body":[
+        \\      {"send":{"receiver":{"var_ref":"TLog"},"selector":"addLast:","args":[{"literal":{"string":"A-in"}}]}},
+        \\      {"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}},
+        \\      {"send":{"receiver":{"var_ref":"TLog"},"selector":"addLast:","args":[{"literal":{"string":"A-out"}}]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+    // Worker B tries non-blocking: should fail and log 'B-skipped'.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":["r"],"body":[
+        \\  {"assign":{"name":"r","value":{"send":{"receiver":{"var_ref":"TM"},"selector":"tryCritical:","args":[
+        \\    {"block":{"params":[],"temps":[],"body":[
+        \\      {"send":{"receiver":{"var_ref":"TLog"},"selector":"addLast:","args":[{"literal":{"string":"B-took-it"}}]}}
+        \\    ]}}
+        \\  ]}}}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"r"},"selector":"==","args":[{"literal":{"nil":true}}]}},"selector":"ifTrue:","args":[
+        \\    {"block":{"params":[],"temps":[],"body":[
+        \\      {"send":{"receiver":{"var_ref":"TLog"},"selector":"addLast:","args":[{"literal":{"string":"B-skipped"}}]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+    var i: u32 = 0;
+    while (i < 6) : (i += 1) {
+        _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Processor\"},\"selector\":\"yield\",\"args\":[]}}");
+    }
+    // Log should contain A-in, B-skipped, A-out (B never took the lock).
+    const sz = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"TLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 3), vm.oop.toInt(sz));
+    var saw_skipped = false;
+    var saw_took = false;
+    var k: i64 = 1;
+    while (k <= 3) : (k += 1) {
+        var buf: [192]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"TLog\"}},\"selector\":\"at:\",\"args\":[{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{k},
+        );
+        const e = try env.evalJson(json);
+        const bytes = vm.object.bytesOf(e)[0..vm.object.headerOf(e).size];
+        if (std.mem.eql(u8, bytes, "B-skipped")) saw_skipped = true;
+        if (std.mem.eql(u8, bytes, "B-took-it")) saw_took = true;
+    }
+    try std.testing.expect(saw_skipped);
+    try std.testing.expect(!saw_took);
+}
+
+test "Mutex tryCritical: succeeds on an unheld mutex" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // (Mutex new init) tryCritical: [42]   →   42
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"send":{"receiver":{"var_ref":"Mutex"},"selector":"new","args":[]}},"selector":"init","args":[]}},
+        \\  "selector":"tryCritical:","args":[
+        \\    {"block":{"params":[],"temps":[],"body":[{"literal":{"int":42}}]}}
+        \\  ]}}
+    );
+    try std.testing.expectEqual(@as(i64, 42), vm.oop.toInt(got));
+}
+
 test "Mutex serialises critical sections across forks" {
     // Two workers each enter `mutex critical: [log addLast: 'X1'.
     // Processor yield. log addLast: 'X2']`. Without the mutex the

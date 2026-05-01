@@ -126,6 +126,7 @@ pub const PRIM_BEHAVIOR_INST_VAR_NAMES: u32 = 313;
 pub const PRIM_BLOCK_IF_CURTAILED: u32 = 320;
 pub const PRIM_EXC_PASS: u32 = 321;
 pub const PRIM_EXC_RESIGNAL_AS: u32 = 322;
+pub const PRIM_EXC_RETRY: u32 = 323;
 pub const PRIM_SOCK_CONNECT: u32 = 330;
 pub const PRIM_SOCK_LISTEN: u32 = 331;
 pub const PRIM_SOCK_ACCEPT: u32 = 332;
@@ -246,6 +247,7 @@ pub fn dispatch(vm: *Vm, prim_id: u32, receiver: Oop, args: []const Oop) PrimErr
         PRIM_BLOCK_IF_CURTAILED => primBlockIfCurtailed(vm, receiver, args),
         PRIM_EXC_PASS => primExceptionPass(vm, receiver, args),
         PRIM_EXC_RESIGNAL_AS => primExceptionResignalAs(vm, receiver, args),
+        PRIM_EXC_RETRY => primExceptionRetry(vm, receiver, args),
         PRIM_SOCK_CONNECT => primSockConnect(vm, receiver, args),
         PRIM_SOCK_LISTEN => primSockListen(vm, receiver, args),
         PRIM_SOCK_ACCEPT => primSockAccept(vm, receiver, args),
@@ -736,6 +738,18 @@ fn primExceptionResignalAs(vm: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
     return error.UserSignal;
 }
 
+// Exception>>retry — re-run the protected block of the most
+// recent enclosing on:do:. Implementation: raise a sentinel
+// EvalError that primBlockOnDo intercepts and turns into a
+// loop iteration. Escaping outside an on:do: leaves the
+// sentinel propagating to the host as error.ExceptionRetry —
+// which is a programmer error (handler called retry without
+// being in a handler scope).
+fn primExceptionRetry(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
+    if (args.len != 0) return error.ArityMismatch;
+    return error.ExceptionRetry;
+}
+
 // Block>>on:do: invokes the receiver. If a UserSignal escapes whose
 // exception isKindOf args[0], invokes args[1] with the exception as
 // argument and returns its result. Otherwise rethrows. Non-signal
@@ -749,22 +763,34 @@ fn primBlockOnDo(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     var pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &slot_ptrs, .n = 3 };
     vm.root_pin = &pin;
     defer vm.root_pin = pin.parent;
-    return vm.sendSym(recv_pin, vm.globals.sym_value, &.{}) catch |e| {
-        if (e == error.UserSignal) {
-            const exc = vm.signaled_exception;
-            if (isKindOfImpl(vm, exc, exc_class_pin)) {
-                vm.signaled_exception = oop_mod.NIL;
-                // Pin args slice element across the handler send.
-                var arg_buf: [1]Oop = .{exc};
-                var arg_pin_slots: [1]?*Oop = .{&arg_buf[0]};
-                var arg_pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &arg_pin_slots, .n = 1 };
-                vm.root_pin = &arg_pin;
-                defer vm.root_pin = arg_pin.parent;
-                return vm.sendSym(handler_pin, vm.globals.sym_value_colon, &arg_buf);
+    // Loop on retry: when the handler ends with Exception>>retry,
+    // primExceptionRetry raises error.ExceptionRetry, we catch
+    // it here, and re-invoke the protected block from the top.
+    while (true) {
+        if (vm.sendSym(recv_pin, vm.globals.sym_value, &.{})) |result| {
+            return result;
+        } else |e| {
+            if (e == error.UserSignal) {
+                const exc = vm.signaled_exception;
+                if (isKindOfImpl(vm, exc, exc_class_pin)) {
+                    vm.signaled_exception = oop_mod.NIL;
+                    // Pin args slice element across the handler send.
+                    var arg_buf: [1]Oop = .{exc};
+                    var arg_pin_slots: [1]?*Oop = .{&arg_buf[0]};
+                    var arg_pin = eval_mod.RootPin{ .parent = vm.root_pin, .slots = &arg_pin_slots, .n = 1 };
+                    vm.root_pin = &arg_pin;
+                    defer vm.root_pin = arg_pin.parent;
+                    if (vm.sendSym(handler_pin, vm.globals.sym_value_colon, &arg_buf)) |hr| {
+                        return hr;
+                    } else |he| {
+                        if (he == error.ExceptionRetry) continue;
+                        return he;
+                    }
+                }
             }
+            return e;
         }
-        return e;
-    };
+    }
 }
 
 // Behavior>>selectors returns an Array of the receiver's own method

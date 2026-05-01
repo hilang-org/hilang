@@ -213,3 +213,61 @@ test "IdentitySet includes: matches by identity" {
     );
     try std.testing.expectEqual(vm.oop.FALSE, has2);
 }
+
+test "Dictionary>>keys returns just the live keys, sized correctly" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"DK"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Dictionary"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"DK"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"a"}},"selector":"asSymbol","args":[]}},{"literal":{"int":1}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"DK"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"b"}},"selector":"asSymbol","args":[]}},{"literal":{"int":2}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"DK"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"c"}},"selector":"asSymbol","args":[]}},{"literal":{"int":3}}
+        \\]}}
+    );
+    const sz = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"DK"},"selector":"keys","args":[]}},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 3), vm.oop.toInt(sz));
+}
+
+test "Dictionary>>values returns just the live values" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"DV"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Dictionary"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"DV"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"a"}},"selector":"asSymbol","args":[]}},{"literal":{"int":10}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"DV"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"b"}},"selector":"asSymbol","args":[]}},{"literal":{"int":20}}
+        \\]}}
+    );
+    // values sum = 30.
+    const sum = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"DV"},"selector":"values","args":[]}},"selector":"sum","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 30), vm.oop.toInt(sum));
+}

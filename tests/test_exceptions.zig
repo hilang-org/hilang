@@ -126,6 +126,42 @@ test "Exception>>pass propagates to outer handler" {
     try std.testing.expectEqual(@as(i64, 2), vm.oop.toInt(sz));
 }
 
+test "Exception>>retry re-runs the protected block" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // Counter starts at 0; protected block increments and
+    // raises when counter < 3, succeeds otherwise. Handler
+    // calls retry. We expect the protected block to re-run
+    // until counter reaches 3, at which point it returns.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"RC"}},"selector":"asSymbol","args":[]}},
+        \\  {"literal":{"int":0}}
+        \\]}}
+    );
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\    {"send":{"receiver":{"literal":{"string":"RC"}},"selector":"asSymbol","args":[]}},
+        \\    {"send":{"receiver":{"var_ref":"RC"},"selector":"+","args":[{"literal":{"int":1}}]}}
+        \\  ]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"RC"},"selector":"<","args":[{"literal":{"int":3}}]}},"selector":"ifTrue:","args":[
+        \\    {"block":{"params":[],"temps":[],"body":[
+        \\      {"send":{"receiver":{"send":{"receiver":{"var_ref":"Exception"},"selector":"new","args":[]}},"selector":"signal:","args":[{"literal":{"string":"again"}}]}}
+        \\    ]}}
+        \\  ]}},
+        \\  {"var_ref":"RC"}
+        \\]}},"selector":"on:do:","args":[
+        \\  {"var_ref":"Exception"},
+        \\  {"block":{"params":["e"],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"e"},"selector":"retry","args":[]}}
+        \\  ]}}
+        \\]}}
+    );
+    try std.testing.expectEqual(@as(i64, 3), vm.oop.toInt(got));
+}
+
 test "Exception>>resignalAs: replaces the in-flight exception" {
     var env: TestEnv = undefined;
     try env.init();

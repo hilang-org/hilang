@@ -1478,6 +1478,43 @@ pub fn loadSUnit(heap: *Heap, g: *Globals) !void {
         try ret(c, try varRef(c, "count")),
     });
 
+    // keys / values — accessors that return a freshly-allocated
+    // Array of just the live entries (the underlying storage
+    // arrays carry trailing capacity slack we don't want to
+    // expose to callers).
+    //
+    // keys
+    //   | r |
+    //   r := Array new: count.
+    //   1 to: count do: [:i | r at: i put: (keys at: i)].
+    //   ^r
+    try defineMethod(c, dict_class, "keys", &.{}, &.{"r"}, &.{
+        try assignNode(c, "r", try send(c, try varRef(c, "Array"), "new:", &.{try varRef(c, "count")})),
+        try send(c, try litInt(c, 1), "to:do:", &.{
+            try varRef(c, "count"),
+            try block(c, &.{"i"}, &.{}, &.{
+                try send(c, try varRef(c, "r"), "at:put:", &.{
+                    try varRef(c, "i"),
+                    try send(c, try varRef(c, "keys"), "at:", &.{try varRef(c, "i")}),
+                }),
+            }),
+        }),
+        try ret(c, try varRef(c, "r")),
+    });
+    try defineMethod(c, dict_class, "values", &.{}, &.{"r"}, &.{
+        try assignNode(c, "r", try send(c, try varRef(c, "Array"), "new:", &.{try varRef(c, "count")})),
+        try send(c, try litInt(c, 1), "to:do:", &.{
+            try varRef(c, "count"),
+            try block(c, &.{"i"}, &.{}, &.{
+                try send(c, try varRef(c, "r"), "at:put:", &.{
+                    try varRef(c, "i"),
+                    try send(c, try varRef(c, "values"), "at:", &.{try varRef(c, "i")}),
+                }),
+            }),
+        }),
+        try ret(c, try varRef(c, "r")),
+    });
+
     // isEmpty inherited from Collection (uses self size = 0).
 
     // includesKey: k
@@ -2599,6 +2636,52 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
     });
     try defineMethod(c, mutex_class, "count", &.{}, &.{}, &.{
         try ret(c, try varRef(c, "count")),
+    });
+
+    // tryCritical: aBlock — non-blocking variant. Returns nil
+    // if the mutex is currently held by a different process;
+    // otherwise behaves like critical:, returning the block's
+    // result. The reentrant fast-path still works (same process
+    // already inside critical: can always tryCritical: again).
+    //
+    // The check `semaphore count = 0` is safe to do without an
+    // atomic primitive because hilang's scheduler is cooperative:
+    // no yield point exists between the check and the
+    // subsequent `wait`, so the count we observe is the count
+    // we'll see at the wait.
+    try defineMethod(c, mutex_class, "tryCritical:", &.{"aBlock"}, &.{"active"}, &.{
+        try assignNode(c, "active", try send(c, try varRef(c, "Processor"), "activeProcess", &.{})),
+        try send(c, try send(c, try varRef(c, "owner"), "==", &.{try varRef(c, "active")}), "ifTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "count", try send(c, try varRef(c, "count"), "+", &.{try litInt(c, 1)})),
+                try ret(c, try send(c, try block(c, &.{}, &.{}, &.{
+                    try send(c, try varRef(c, "aBlock"), "value", &.{}),
+                }), "ensure:", &.{
+                    try block(c, &.{}, &.{}, &.{
+                        try assignNode(c, "count", try send(c, try varRef(c, "count"), "-", &.{try litInt(c, 1)})),
+                    }),
+                })),
+            }),
+        }),
+        try send(c, try send(c, try send(c, try varRef(c, "semaphore"), "count", &.{}), "=", &.{try litInt(c, 0)}), "ifTrue:", &.{
+            try block(c, &.{}, &.{}, &.{try ret(c, try litNil(c))}),
+        }),
+        try send(c, try varRef(c, "semaphore"), "wait", &.{}),
+        try assignNode(c, "owner", try varRef(c, "active")),
+        try assignNode(c, "count", try litInt(c, 1)),
+        try ret(c, try send(c, try block(c, &.{}, &.{}, &.{
+            try send(c, try varRef(c, "aBlock"), "value", &.{}),
+        }), "ensure:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try assignNode(c, "count", try send(c, try varRef(c, "count"), "-", &.{try litInt(c, 1)})),
+                try send(c, try send(c, try varRef(c, "count"), "=", &.{try litInt(c, 0)}), "ifTrue:", &.{
+                    try block(c, &.{}, &.{}, &.{
+                        try assignNode(c, "owner", try litNil(c)),
+                        try send(c, try varRef(c, "semaphore"), "signal", &.{}),
+                    }),
+                }),
+            }),
+        })),
     });
 
     // ---- SharedQueue ----
