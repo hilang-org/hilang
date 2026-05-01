@@ -5,12 +5,14 @@ on:
     branches: [master]
   pull_request:
 
-# Opt every JS action into the Node 24 runtime now that
-# GitHub has deprecated Node 20 (per the 2025-09-19
-# changelog). Setting this at the workflow level forces
-# even un-updated actions like actions/checkout@v4 onto
-# Node 24, dodging the deprecation warning that otherwise
-# fires on every job.
+# GitHub deprecated Node 20 on 2025-09-19; the proper fix
+# is to bump every action to a release that runs on Node 24.
+# actions/checkout@v6 (2025-11-20) is on Node 24. mlugg/
+# setup-zig is still on Node 20 as of v2.2.1 (2026-01-19) —
+# its README hasn't tagged a Node 24 release yet, so we set
+# FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true at the workflow
+# level to force the new runtime for that one. Drop the env
+# var when setup-zig ships a Node 24 release.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
@@ -29,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2
