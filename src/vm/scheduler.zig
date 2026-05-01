@@ -83,15 +83,19 @@ comptime {
 // the optimizer interleaving body around a Zig-generated frame),
 // hence this extra layer.
 //
-// Mach-O symbols take a leading underscore; `extern fn swap`
-// references `_swap`, which is the label below.
+// Mach-O symbols take a leading underscore; ELF (Linux) does
+// not. We emit both labels in the asm body and `.global` both
+// names — the linker on each platform picks the one its ABI
+// expects, and the unused one is harmless.
 pub extern fn swap(old_ctx: *Context, new_ctx: *Context) void;
 
 comptime {
     asm (
         \\ .global _swap
+        \\ .global swap
         \\ .p2align 2
         \\ _swap:
+        \\ swap:
         \\   stp x19, x20, [x0,  #0]
         \\   stp x21, x22, [x0, #16]
         \\   stp x23, x24, [x0, #32]

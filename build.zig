@@ -4,16 +4,25 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Link libc unconditionally. On macOS this matches the
+    // existing implicit linkage (jit.zig calls into libc for
+    // pthread_jit_write_protect_np / sys_icache_invalidate).
+    // On Linux it routes std.posix.system.* through libc (so
+    // open/socket return c_int instead of usize, and
+    // getaddrinfo is available) — without this the same source
+    // tree won't compile against std.os.linux's raw syscalls.
     const vm_mod = b.createModule(.{
         .root_source_file = b.path("src/vm/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const server_mod = b.createModule(.{
         .root_source_file = b.path("src/server/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     server_mod.addImport("vm", vm_mod);
 
@@ -27,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/client/main.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
 
     const client_exe = b.addExecutable(.{
@@ -59,6 +69,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/all.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     tests_mod.addImport("vm", vm_mod);
     const protocol_tests = b.addTest(.{ .root_module = tests_mod });
@@ -71,6 +82,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/harness.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     harness_mod.addImport("vm", vm_mod);
 
@@ -79,6 +91,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("bench/micros.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     micros_mod.addImport("vm", vm_mod);
     micros_mod.addImport("harness", harness_mod);
@@ -95,6 +108,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("bench/suite.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     suite_mod.addImport("vm", vm_mod);
     suite_mod.addImport("harness", harness_mod);

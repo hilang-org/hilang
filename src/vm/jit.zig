@@ -17,22 +17,50 @@ const oop_mod = @import("oop.zig");
 const bc = @import("bytecode.zig");
 const Oop = oop_mod.Oop;
 
-// macOS / Apple-Silicon specific extern declarations. We reach past
-// std.posix to set MAP_JIT in the raw mmap flags; std doesn't expose
-// that bit yet.
+// Bare-libc declarations for the small set of POSIX calls we
+// touch directly. We bypass std.posix here because:
+//  - macOS needs MAP_JIT (0x800) which std.posix doesn't expose,
+//  - pthread_jit_write_protect_np / sys_icache_invalidate are
+//    darwin-only and not part of std.
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) ?*anyopaque;
 extern "c" fn munmap(addr: *anyopaque, len: usize) c_int;
+extern "c" fn mprotect(addr: *anyopaque, len: usize, prot: c_int) c_int;
+
+// Darwin-only JIT helpers. Stubbed out as no-ops on Linux (no
+// W^X enforcement at this layer; AArch64 i-cache flush is
+// inlined as `dc cvau` + `ic ivau` + `dsb ish` + `isb` in
+// markExecutable on Linux).
 extern "c" fn pthread_jit_write_protect_np(executable: c_int) void;
 extern "c" fn pthread_jit_write_protect_supported_np() c_int;
 extern "c" fn sys_icache_invalidate(start: ?*const anyopaque, len: usize) void;
+comptime {
+    if (builtin.os.tag == .linux) {
+        // Provide weak stubs so the macOS-only externs link
+        // cleanly on ELF. Each is a no-op; the real cache flush
+        // is the inline asm in markExecutable.
+        asm (
+            \\ .weak pthread_jit_write_protect_np
+            \\ .weak pthread_jit_write_protect_supported_np
+            \\ .weak sys_icache_invalidate
+            \\ pthread_jit_write_protect_np:
+            \\     ret
+            \\ pthread_jit_write_protect_supported_np:
+            \\     mov w0, #0
+            \\     ret
+            \\ sys_icache_invalidate:
+            \\     ret
+        );
+    }
+}
 
 const PROT_READ: c_int = 0x01;
 const PROT_WRITE: c_int = 0x02;
 const PROT_EXEC: c_int = 0x04;
 
 const MAP_PRIVATE: c_int = 0x0002;
-const MAP_ANON: c_int = 0x1000;
-const MAP_JIT: c_int = 0x0800;
+// MAP_ANON differs by OS: 0x1000 on darwin, 0x20 on Linux.
+const MAP_ANON: c_int = if (builtin.os.tag == .linux) 0x20 else 0x1000;
+const MAP_JIT: c_int = if (builtin.os.tag == .linux) 0 else 0x0800;
 
 const MAP_FAILED: usize = std.math.maxInt(usize); // (void*)-1
 
@@ -60,7 +88,10 @@ pub const JitBuf = struct {
     // when MAP_JIT is set; pthread_jit_write_protect_np then gates
     // write vs execute per thread.
     pub fn alloc(capacity: usize) !JitBuf {
-        if (builtin.os.tag != .macos) return error.NotImplementedOnPlatform;
+        switch (builtin.os.tag) {
+            .macos, .linux => {},
+            else => return error.NotImplementedOnPlatform,
+        }
         const page = std.heap.page_size_min;
         const rounded = std.mem.alignForward(usize, capacity, page);
         const addr = mmap(
@@ -91,10 +122,41 @@ pub const JitBuf = struct {
     // Flip back to executable and flush the i-cache so the CPU sees
     // the freshly-written instructions.
     pub fn markExecutable(self: *JitBuf) void {
-        if (pthread_jit_write_protect_supported_np() != 0) {
-            pthread_jit_write_protect_np(1);
+        switch (builtin.os.tag) {
+            .macos, .ios, .watchos, .tvos => {
+                if (pthread_jit_write_protect_supported_np() != 0) {
+                    pthread_jit_write_protect_np(1);
+                }
+                sys_icache_invalidate(@ptrCast(self.bytes.ptr), self.pos);
+            },
+            .linux => {
+                // AArch64 i-cache flush: walk the byte range and
+                // emit `dc cvau` / `ic ivau` per cache line, then
+                // a barrier pair. CTR_EL0 reports the line size;
+                // for simplicity we use 64 bytes which is
+                // standard on all current AArch64 cores.
+                const start: usize = @intFromPtr(self.bytes.ptr);
+                const end: usize = start + self.pos;
+                var p: usize = start & ~@as(usize, 63);
+                while (p < end) : (p += 64) {
+                    asm volatile ("dc cvau, %[p]"
+                        :
+                        : [p] "r" (p),
+                        : .{ .memory = true });
+                }
+                asm volatile ("dsb ish" ::: .{ .memory = true });
+                p = start & ~@as(usize, 63);
+                while (p < end) : (p += 64) {
+                    asm volatile ("ic ivau, %[p]"
+                        :
+                        : [p] "r" (p),
+                        : .{ .memory = true });
+                }
+                asm volatile ("dsb ish" ::: .{ .memory = true });
+                asm volatile ("isb" ::: .{ .memory = true });
+            },
+            else => {},
         }
-        sys_icache_invalidate(@ptrCast(self.bytes.ptr), self.pos);
     }
 
     // Append one ARM64 instruction (4 bytes, little-endian).
