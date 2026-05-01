@@ -1027,6 +1027,63 @@ pub fn loadSUnit(heap: *Heap, g: *Globals) !void {
         try ret(c, try varRef(c, "r")),
     });
 
+    // shuffle / shuffle: aRandom — Fisher-Yates in place. The
+    // overload taking an explicit Random lets callers pin a
+    // deterministic seed; the no-arg form spins up a fresh
+    // clock-seeded Random per call.
+    //
+    // shuffle: aRandom
+    //   | n j t |
+    //   n := self size.
+    //   n to: 2 by: -1 do: [:i |
+    //     j := (aRandom nextInteger: i) + 1.
+    //     t := self at: i.
+    //     self at: i put: (self at: j).
+    //     self at: j put: t].
+    //   ^self
+    try defineMethod(c, sequenceable_class, "shuffle:", &.{"aRandom"}, &.{ "n", "j", "t" }, &.{
+        try assignNode(c, "n", try send(c, try varRef(c, "self"), "size", &.{})),
+        try send(c, try varRef(c, "n"), "to:by:do:", &.{
+            try litInt(c, 2),
+            try litInt(c, -1),
+            try block(c, &.{"i"}, &.{}, &.{
+                try assignNode(c, "j", try send(c, try send(c, try varRef(c, "aRandom"), "nextInteger:", &.{try varRef(c, "i")}), "+", &.{try litInt(c, 1)})),
+                try assignNode(c, "t", try send(c, try varRef(c, "self"), "at:", &.{try varRef(c, "i")})),
+                try send(c, try varRef(c, "self"), "at:put:", &.{
+                    try varRef(c, "i"),
+                    try send(c, try varRef(c, "self"), "at:", &.{try varRef(c, "j")}),
+                }),
+                try send(c, try varRef(c, "self"), "at:put:", &.{try varRef(c, "j"), try varRef(c, "t")}),
+            }),
+        }),
+        try ret(c, try varRef(c, "self")),
+    });
+    try defineMethod(c, sequenceable_class, "shuffle", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "shuffle:", &.{
+            try send(c, try varRef(c, "Random"), "new", &.{}),
+        })),
+    });
+
+    // sample / sample: aRandom — return one uniformly-random
+    // element. Empty receivers signal Exception so callers
+    // get a Smalltalk-level error rather than a divide-by-zero
+    // out of `\\ 0`.
+    try defineMethod(c, sequenceable_class, "sample:", &.{"aRandom"}, &.{}, &.{
+        try send(c, try send(c, try varRef(c, "self"), "isEmpty", &.{}), "ifTrue:", &.{
+            try block(c, &.{}, &.{}, &.{
+                try send(c, try send(c, try varRef(c, "Exception"), "new", &.{}), "signal:", &.{try litString(c, "sample: empty collection")}),
+            }),
+        }),
+        try ret(c, try send(c, try varRef(c, "self"), "at:", &.{
+            try send(c, try send(c, try varRef(c, "aRandom"), "nextInteger:", &.{try send(c, try varRef(c, "self"), "size", &.{})}), "+", &.{try litInt(c, 1)}),
+        })),
+    });
+    try defineMethod(c, sequenceable_class, "sample", &.{}, &.{}, &.{
+        try ret(c, try send(c, try varRef(c, "self"), "sample:", &.{
+            try send(c, try varRef(c, "Random"), "new", &.{}),
+        })),
+    });
+
     // Reparent Array, Interval to SequenceableCollection.
     object.setSlot(g.array_class, object.SLOT_SUPERCLASS, sequenceable_class);
     object.setSlot(object.headerOf(g.array_class).class, object.SLOT_SUPERCLASS, object.headerOf(sequenceable_class).class);

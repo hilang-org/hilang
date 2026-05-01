@@ -172,6 +172,159 @@ test "Random>>nextBoolean produces a fair-ish mix" {
     try std.testing.expect(vm.oop.toInt(f) > 50);
 }
 
+test "Array shuffle: with deterministic Random produces a permutation" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    // Build [1, 2, 3, 4, 5] in an Array, shuffle deterministically,
+    // verify that every element 1..5 still appears exactly once.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"Sa"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Array"},"selector":"new:","args":[{"literal":{"int":5}}]}}
+        \\]}}
+    );
+    const fill_indices = [_]i64{ 1, 2, 3, 4, 5 };
+    for (fill_indices, 1..) |v, i| {
+        var buf: [256]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"Sa\"}},\"selector\":\"at:put:\",\"args\":[{{\"literal\":{{\"int\":{}}}}},{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{ i, v },
+        );
+        _ = try env.evalJson(json);
+    }
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Sa"},"selector":"shuffle:","args":[
+        \\  {"send":{"receiver":{"var_ref":"Random"},"selector":"seed:","args":[{"literal":{"int":42}}]}}
+        \\]}}
+    );
+
+    // Sum after shuffle is still 15 (1+2+3+4+5).
+    const sum = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Sa"},"selector":"sum","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 15), vm.oop.toInt(sum));
+    // Size unchanged.
+    const sz = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Sa"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 5), vm.oop.toInt(sz));
+    // All five values still present (unique).
+    var seen: [6]bool = .{false} ** 6;
+    var i: u32 = 1;
+    while (i <= 5) : (i += 1) {
+        var buf: [192]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"Sa\"}},\"selector\":\"at:\",\"args\":[{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{i},
+        );
+        const v = vm.oop.toInt(try env.evalJson(json));
+        try std.testing.expect(v >= 1 and v <= 5 and !seen[@intCast(v)]);
+        seen[@intCast(v)] = true;
+    }
+}
+
+test "shuffle: with same seed is deterministic" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // Two arrays seeded identically must end up identical post-shuffle.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"Sb"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Array"},"selector":"new:","args":[{"literal":{"int":4}}]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"Sc"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Array"},"selector":"new:","args":[{"literal":{"int":4}}]}}
+        \\]}}
+    );
+    var k: i64 = 1;
+    while (k <= 4) : (k += 1) {
+        var buf1: [192]u8 = undefined;
+        var buf2: [192]u8 = undefined;
+        _ = try env.evalJson(try std.fmt.bufPrint(&buf1,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"Sb\"}},\"selector\":\"at:put:\",\"args\":[{{\"literal\":{{\"int\":{}}}}},{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{ k, k * 10 },
+        ));
+        _ = try env.evalJson(try std.fmt.bufPrint(&buf2,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"Sc\"}},\"selector\":\"at:put:\",\"args\":[{{\"literal\":{{\"int\":{}}}}},{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{ k, k * 10 },
+        ));
+    }
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Sb"},"selector":"shuffle:","args":[
+        \\  {"send":{"receiver":{"var_ref":"Random"},"selector":"seed:","args":[{"literal":{"int":1}}]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Sc"},"selector":"shuffle:","args":[
+        \\  {"send":{"receiver":{"var_ref":"Random"},"selector":"seed:","args":[{"literal":{"int":1}}]}}
+        \\]}}
+    );
+    var i: i64 = 1;
+    while (i <= 4) : (i += 1) {
+        var bufA: [192]u8 = undefined;
+        var bufB: [192]u8 = undefined;
+        const a = try env.evalJson(try std.fmt.bufPrint(&bufA,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"Sb\"}},\"selector\":\"at:\",\"args\":[{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{i},
+        ));
+        const b = try env.evalJson(try std.fmt.bufPrint(&bufB,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"Sc\"}},\"selector\":\"at:\",\"args\":[{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{i},
+        ));
+        try std.testing.expectEqual(vm.oop.toInt(a), vm.oop.toInt(b));
+    }
+}
+
+test "sample: returns an element from the receiver" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"Sd"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Array"},"selector":"new:","args":[{"literal":{"int":3}}]}}
+        \\]}}
+    );
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Sd\"},\"selector\":\"at:put:\",\"args\":[{\"literal\":{\"int\":1}},{\"literal\":{\"int\":10}}]}}");
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Sd\"},\"selector\":\"at:put:\",\"args\":[{\"literal\":{\"int\":2}},{\"literal\":{\"int\":20}}]}}");
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Sd\"},\"selector\":\"at:put:\",\"args\":[{\"literal\":{\"int\":3}},{\"literal\":{\"int\":30}}]}}");
+    var i: u32 = 0;
+    while (i < 30) : (i += 1) {
+        const v = try env.evalJson(
+            \\{"send":{"receiver":{"var_ref":"Sd"},"selector":"sample","args":[]}}
+        );
+        const n = vm.oop.toInt(v);
+        try std.testing.expect(n == 10 or n == 20 or n == 30);
+    }
+}
+
+test "sample on empty signals an Exception" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}},"selector":"sample","args":[]}}
+        \\]}},"selector":"on:do:","args":[
+        \\  {"var_ref":"Exception"},
+        \\  {"block":{"params":["e"],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"e"},"selector":"messageText","args":[]}}
+        \\  ]}}
+        \\]}}
+    );
+    try std.testing.expect(vm.oop.isHeapPtr(got));
+    try std.testing.expectEqualStrings(
+        "sample: empty collection",
+        vm.object.bytesOf(got)[0..vm.object.headerOf(got).size],
+    );
+}
+
 test "Random new auto-seeds from clock and produces Floats in range" {
     var env: TestEnv = undefined;
     try env.init();
