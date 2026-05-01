@@ -604,6 +604,90 @@ test "Delay wait blocks at least N nanoseconds" {
     try std.testing.expect(elapsed < 1_000_000_000);
 }
 
+test "Process>>onCrash: receives the uncaught exception from the forked block" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    // Stash a log so the handler can record what it saw; the
+    // worker block raises 'boom' which the onCrash handler
+    // catches and appends the messageText to the log.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"CrashLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+
+    // p := [Exception new signal: 'boom'] fork.
+    // p onCrash: [:e | CrashLog addLast: e messageText].
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"CrashP"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\    {"send":{"receiver":{"send":{"receiver":{"var_ref":"Exception"},"selector":"new","args":[]}},"selector":"signal:","args":[{"literal":{"string":"boom"}}]}}
+        \\  ]}},"selector":"fork","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"CrashP"},"selector":"onCrash:","args":[
+        \\  {"block":{"params":["e"],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"CrashLog"},"selector":"addLast:","args":[
+        \\      {"send":{"receiver":{"var_ref":"e"},"selector":"messageText","args":[]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}}
+    );
+
+    // Drive the schedule. Two yields are enough to start the
+    // worker, let it raise, and trigger the handler before
+    // termination.
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Processor\"},\"selector\":\"yield\",\"args\":[]}}");
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Processor\"},\"selector\":\"yield\",\"args\":[]}}");
+
+    const sz = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"CrashLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 1), vm.oop.toInt(sz));
+    const msg = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"CrashLog"},"selector":"first","args":[]}}
+    );
+    try std.testing.expectEqualStrings(
+        "boom",
+        vm.object.bytesOf(msg)[0..vm.object.headerOf(msg).size],
+    );
+}
+
+test "Process without onCrash: silently swallows the exception" {
+    // Pre-existing behaviour preserved when no handler is set:
+    // the worker terminates cleanly, main keeps running, no
+    // error escapes to the host. We assert by observing main's
+    // own state across the worker's crash.
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"AfterCrash"}},"selector":"asSymbol","args":[]}},
+        \\  {"literal":{"int":0}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"Exception"},"selector":"new","args":[]}},"selector":"signal:","args":[{"literal":{"string":"silent"}}]}}
+        \\]}},"selector":"fork","args":[]}}
+    );
+    _ = try env.evalJson("{\"send\":{\"receiver\":{\"var_ref\":\"Processor\"},\"selector\":\"yield\",\"args\":[]}}");
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"AfterCrash"}},"selector":"asSymbol","args":[]}},
+        \\  {"literal":{"int":42}}
+        \\]}}
+    );
+    const got = try env.evalJson("{\"var_ref\":\"AfterCrash\"}");
+    try std.testing.expectEqual(@as(i64, 42), vm.oop.toInt(got));
+}
+
 test "Terminated processes are reaped from the Vm's process list" {
     // Without the reaper, every fork leaves a dangling Process oop
     // on Vm.all_processes (and a 2 MiB mmap'd stack on

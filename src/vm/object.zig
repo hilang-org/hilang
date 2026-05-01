@@ -221,7 +221,11 @@ pub const SLOT_PROCESS_WAIT_EVENT: u32 = 12;
 // computing the kqueue/epoll timeout, and expires any whose
 // deadline has elapsed by setting wait_fd to -2.
 pub const SLOT_PROCESS_WAIT_DEADLINE: u32 = 13;
-pub const PROCESS_INST_SIZE: u32 = 14;
+// Optional handler block invoked when the forked block escapes
+// with a UserSignal exception. NIL means "swallow silently"
+// (the existing behavior). Set via Process>>onCrash:.
+pub const SLOT_PROCESS_ON_CRASH: u32 = 14;
+pub const PROCESS_INST_SIZE: u32 = 15;
 
 // Semaphore { count, waitersHead, waitersTail }
 //   count        — SmallInt; signal increments, wait decrements when > 0.

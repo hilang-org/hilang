@@ -2350,7 +2350,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
             "priority", "state",     "block",      "name",
             "nextLink", "result",    "suspendedContext",
             "savedFrame", "savedMethodFrame", "savedMethodClass",
-            "deadline", "waitFd", "waitEvent", "waitDeadline",
+            "deadline", "waitFd", "waitEvent", "waitDeadline", "onCrash",
         },
     );
     g.process_class = process_class;
@@ -2370,6 +2370,18 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
     });
     try defineMethod(c, process_class, "isTerminated", &.{}, &.{}, &.{
         try ret(c, try send(c, try varRef(c, "state"), "==", &.{try lit(c, g.sym_terminated)})),
+    });
+
+    // Process>>onCrash: aBlock — install a handler that fires
+    // when the forked block raises an uncaught Smalltalk
+    // exception. The handler receives the Exception oop as its
+    // single argument; its own return value is discarded.
+    try defineMethod(c, process_class, "onCrash:", &.{"aBlock"}, &.{}, &.{
+        try assignNode(c, "onCrash", try varRef(c, "aBlock")),
+        try ret(c, try varRef(c, "self")),
+    });
+    try defineMethod(c, process_class, "onCrash", &.{}, &.{}, &.{
+        try ret(c, try varRef(c, "onCrash")),
     });
 
     // ---- Semaphore ----

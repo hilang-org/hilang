@@ -400,6 +400,7 @@ pub const Vm = struct {
         object.setSlot(main, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-1));
         object.setSlot(main, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(0));
         object.setSlot(main, object.SLOT_PROCESS_WAIT_DEADLINE, oop_mod.fromInt(0));
+        object.setSlot(main, object.SLOT_PROCESS_ON_CRASH, oop_mod.NIL);
         var main_pin: Oop = main;
         var slots: [1]?*Oop = .{&main_pin};
         var pin = RootPin{ .parent = self.root_pin, .slots = &slots, .n = 1 };
@@ -1999,7 +2000,26 @@ fn processEntry(arg: ?*anyopaque) callconv(.c) noreturn {
     const block = object.slot(proc, object.SLOT_PROCESS_BLOCK);
     var result: Oop = oop_mod.NIL;
     if (oop_mod.isHeapPtr(block)) {
-        result = vm.send(block, "value", &.{}) catch oop_mod.NIL;
+        result = blk: {
+            const r = vm.send(block, "value", &.{}) catch |e| {
+                // UserSignal escapes are routed to the process's
+                // onCrash handler if one is installed; otherwise
+                // the exception is silently swallowed (existing
+                // behaviour). Other Zig errors stay swallowed too
+                // so the parent host thread can resume.
+                if (e == error.UserSignal) {
+                    const exc = vm.signaled_exception;
+                    vm.signaled_exception = oop_mod.NIL;
+                    const on_crash = object.slot(proc, object.SLOT_PROCESS_ON_CRASH);
+                    if (oop_mod.isHeapPtr(on_crash) and oop_mod.isHeapPtr(exc)) {
+                        var args_buf: [1]Oop = .{exc};
+                        _ = vm.sendSym(on_crash, vm.globals.sym_value_colon, &args_buf) catch {};
+                    }
+                }
+                break :blk oop_mod.NIL;
+            };
+            break :blk r;
+        };
     }
     object.setSlot(proc, object.SLOT_PROCESS_RESULT, result);
     object.setSlot(proc, object.SLOT_PROCESS_STATE, vm.globals.sym_terminated);

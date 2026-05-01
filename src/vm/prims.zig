@@ -1469,6 +1469,7 @@ fn newProcess(vm: *Vm, block: Oop, priority: i64) PrimError!Oop {
     object.setSlot(p, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-1));
     object.setSlot(p, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(0));
     object.setSlot(p, object.SLOT_PROCESS_WAIT_DEADLINE, oop_mod.fromInt(0));
+    object.setSlot(p, object.SLOT_PROCESS_ON_CRASH, oop_mod.NIL);
     return p;
 }
 
