@@ -1429,6 +1429,8 @@ fn newProcess(vm: *Vm, block: Oop, priority: i64) PrimError!Oop {
     object.setSlot(p, object.SLOT_PROCESS_SAVED_METHOD_FRAME, oop_mod.NIL);
     object.setSlot(p, object.SLOT_PROCESS_SAVED_METHOD_CLASS, oop_mod.NIL);
     object.setSlot(p, object.SLOT_PROCESS_DEADLINE, oop_mod.fromInt(0));
+    object.setSlot(p, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-1));
+    object.setSlot(p, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(0));
     return p;
 }
 
@@ -1623,6 +1625,20 @@ fn primTimeMonoNanos(_: *Vm, _: Oop, args: []const Oop) PrimError!Oop {
     return oop_mod.fromInt(nanos);
 }
 
+// O_NONBLOCK bit on darwin/BSD: bit position 2, value 4. Same
+// numeric value as the C `O_NONBLOCK` macro on this platform.
+const O_NONBLOCK_BIT: c_int = 4;
+
+// Set O_NONBLOCK on `fd` so subsequent read/write/accept don't
+// block the host thread. Best-effort: any error here just leaves
+// the fd in blocking mode, which still works (just less
+// concurrently) so we don't propagate failure.
+fn setNonblock(fd: c_int) void {
+    const cur = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(c_int, 0));
+    if (cur < 0) return;
+    _ = std.posix.system.fcntl(fd, std.posix.F.SETFL, cur | O_NONBLOCK_BIT);
+}
+
 // IPv4/IPv6 + DNS socket primitives. Receiver is a Socket whose
 // first ivar (slot 0) holds the underlying fd — same convention
 // as FileStream so the read:/readAll/nextPutAll:/primClose
@@ -1689,6 +1705,10 @@ fn primSockConnect(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
             continue;
         };
         if (std.posix.system.connect(fd, addr, ai.addrlen) == 0) {
+            // Connect blocked through to completion; switch to
+            // non-blocking now so subsequent read/write yield to
+            // the scheduler instead of freezing the host thread.
+            setNonblock(fd);
             object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
             return receiver;
         }
@@ -1721,19 +1741,33 @@ fn primSockListen(_: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
         _ = std.posix.system.close(fd);
         return error.PrimitiveFailed;
     }
+    setNonblock(fd);
     object.setSlot(receiver, FS_FD_SLOT, oop_mod.fromInt(@intCast(fd)));
     return receiver;
 }
 
-// Socket>>accept  — block on the listener's accept(), then
-// allocate a fresh Socket whose fd is the new connected fd.
-// Returns the new Socket; the receiver remains the listener.
+// Socket>>accept — wait for an incoming connection on the
+// listener, allocate a fresh Socket holding the accepted fd.
+// On a non-blocking listener (which is what primSockListen
+// installs), accept() returns -1/EAGAIN when nothing's queued;
+// we park the active green thread on the listener fd via
+// kqueue and retry once it's ready, so other green threads
+// keep running in the meantime.
 fn primSockAccept(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     if (args.len != 0) return error.ArityMismatch;
     if (!oop_mod.isHeapPtr(receiver)) return error.TypeError;
     const listen_fd = try fsFdOf(receiver);
-    const cli_fd = std.posix.system.accept(listen_fd, null, null);
-    if (cli_fd < 0) return error.PrimitiveFailed;
+    const cli_fd = blk: while (true) {
+        const rc = std.posix.system.accept(listen_fd, null, null);
+        if (rc >= 0) break :blk rc;
+        const e = std.posix.errno(rc);
+        switch (e) {
+            .AGAIN => vm.waitForFd(listen_fd, 0) catch return error.PrimitiveFailed,
+            .INTR => continue,
+            else => return error.PrimitiveFailed,
+        }
+    };
+    setNonblock(cli_fd);
     if (!oop_mod.isHeapPtr(vm.globals.socket_class)) {
         _ = std.posix.system.close(cli_fd);
         return error.PrimitiveFailed;
@@ -2080,7 +2114,16 @@ fn primFsRead(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
 
     const tmp = std.heap.page_allocator.alloc(u8, max) catch return error.OutOfMemory;
     defer std.heap.page_allocator.free(tmp);
-    const n = std.posix.read(fd, tmp) catch return error.PrimitiveFailed;
+    const n = while (true) {
+        const r = std.posix.read(fd, tmp) catch |e| switch (e) {
+            error.WouldBlock => {
+                vm.waitForFd(fd, 0) catch return error.PrimitiveFailed;
+                continue;
+            },
+            else => return error.PrimitiveFailed,
+        };
+        break r;
+    };
     const result = try vm.heap.allocBytes(vm.globals.string_class, @intCast(n));
     if (n > 0) @memcpy(object.bytesOf(result)[0..n], tmp[0..n]);
     return result;
@@ -2098,7 +2141,13 @@ fn primFsReadAll(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     defer buf.deinit(alloc);
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const n = std.posix.read(fd, &chunk) catch return error.PrimitiveFailed;
+        const n = std.posix.read(fd, &chunk) catch |e| switch (e) {
+            error.WouldBlock => {
+                vm.waitForFd(fd, 0) catch return error.PrimitiveFailed;
+                continue;
+            },
+            else => return error.PrimitiveFailed,
+        };
         if (n == 0) break;
         buf.appendSlice(alloc, chunk[0..n]) catch return error.OutOfMemory;
     }
@@ -2108,9 +2157,11 @@ fn primFsReadAll(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
 }
 
 // FileStream>>nextPutAll: aString  — write the byte payload to fd
-// in a loop until it's all out. Returns receiver so chains compose.
+// in a loop until it's all out. On a non-blocking socket the
+// kernel buffer can fill up; in that case we park the active
+// process on writability via kqueue and retry. Returns receiver
+// so chains compose.
 fn primFsWrite(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
-    _ = vm;
     if (args.len != 1) return error.ArityMismatch;
     const fd = try fsFdOf(receiver);
     if (!oop_mod.isHeapPtr(args[0])) return error.TypeError;
@@ -2121,9 +2172,17 @@ fn primFsWrite(vm: *Vm, receiver: Oop, args: []const Oop) PrimError!Oop {
     var written: usize = 0;
     while (written < bytes.len) {
         const rc = std.posix.system.write(fd, bytes.ptr + written, bytes.len - written);
-        if (rc < 0) return error.PrimitiveFailed;
+        if (rc > 0) {
+            written += @intCast(rc);
+            continue;
+        }
         if (rc == 0) break;
-        written += @intCast(rc);
+        const e = std.posix.errno(rc);
+        switch (e) {
+            .AGAIN => vm.waitForFd(fd, 1) catch return error.PrimitiveFailed,
+            .INTR => continue,
+            else => return error.PrimitiveFailed,
+        }
     }
     return receiver;
 }

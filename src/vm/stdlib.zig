@@ -2350,7 +2350,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
             "priority", "state",     "block",      "name",
             "nextLink", "result",    "suspendedContext",
             "savedFrame", "savedMethodFrame", "savedMethodClass",
-            "deadline",
+            "deadline", "waitFd", "waitEvent",
         },
     );
     g.process_class = process_class;
@@ -2419,7 +2419,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
         g,
         "ProcessorScheduler",
         g.object_class,
-        &.{ "quiescentLists", "activeProcess", "delayHead" },
+        &.{ "quiescentLists", "activeProcess", "delayHead", "ioHead" },
     );
     g.scheduler_class = scheduler_class;
 
@@ -2448,6 +2448,7 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
     object.setSlot(processor, object.SLOT_SCHEDULER_QLISTS, qlists);
     object.setSlot(processor, object.SLOT_SCHEDULER_ACTIVE, oop_mod.NIL);
     object.setSlot(processor, object.SLOT_SCHEDULER_DELAY_HEAD, oop_mod.NIL);
+    object.setSlot(processor, object.SLOT_SCHEDULER_IO_HEAD, oop_mod.NIL);
     g.processor = processor;
     _ = try dict.atPut(heap, g.smalltalk, g, "Processor", processor);
 

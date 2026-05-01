@@ -205,6 +205,11 @@ pub const Vm = struct {
     // them). Terminated processes stay in the list — their
     // ProcessState.bc_pin is zero, so the chain walk is a no-op.
     all_processes: std.ArrayList(Oop) = .empty,
+    // kqueue used by primSockRead/Write/Accept's EAGAIN-aware
+    // retry loop. Lazily created on first use; -1 means "not yet
+    // initialised". Closed in Vm.deinit. macOS-only for now —
+    // Linux would swap this for an epoll fd with the same shape.
+    kq_fd: i32 = -1,
 
     // Collect garbage. Roots are every Oop field on the Vm itself plus
     // the Smalltalk anchor in the heap header (the GC handles the
@@ -391,6 +396,8 @@ pub const Vm = struct {
         object.setSlot(main, object.SLOT_PROCESS_SAVED_METHOD_FRAME, oop_mod.NIL);
         object.setSlot(main, object.SLOT_PROCESS_SAVED_METHOD_CLASS, oop_mod.NIL);
         object.setSlot(main, object.SLOT_PROCESS_DEADLINE, oop_mod.fromInt(0));
+        object.setSlot(main, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-1));
+        object.setSlot(main, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(0));
         var main_pin: Oop = main;
         var slots: [1]?*Oop = .{&main_pin};
         var pin = RootPin{ .parent = self.root_pin, .slots = &slots, .n = 1 };
@@ -441,6 +448,8 @@ pub const Vm = struct {
     /// any terminated processes' mmap stacks.
     fn dequeueHighestRunnable(self: *Vm) Oop {
         self.expireSleepers(monotonicNanos());
+        var zero_ts: std.posix.timespec = .{ .sec = 0, .nsec = 0 };
+        self.expireIoWaiters(&zero_ts);
         self.reapTerminated();
         const sched = self.globals.processor;
         if (!oop_mod.isHeapPtr(sched)) return oop_mod.NIL;
@@ -498,6 +507,101 @@ pub const Vm = struct {
         const after = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
         object.setSlot(process, object.SLOT_PROCESS_NEXT_LINK, after);
         object.setSlot(cur, object.SLOT_PROCESS_NEXT_LINK, process);
+    }
+
+    /// Lazy-initialise the per-Vm kqueue used by waitForFd. -1
+    /// stays in `kq_fd` until first use, so VMs that never touch a
+    /// non-blocking fd don't pay for the syscall.
+    fn ensureKqueue(self: *Vm) !i32 {
+        if (self.kq_fd >= 0) return self.kq_fd;
+        const fd = std.posix.system.kqueue();
+        if (fd < 0) return error.PrimitiveFailed;
+        self.kq_fd = fd;
+        return fd;
+    }
+
+    /// Park the active process on `fd`'s readability (event=0) or
+    /// writability (event=1), register a one-shot kqueue
+    /// subscription, and yield. Returns when `expireIoWaiters`
+    /// observes the event and re-queues us as runnable.
+    pub fn waitForFd(self: *Vm, fd: i32, event: u8) !void {
+        const kq = try self.ensureKqueue();
+        var change: std.posix.Kevent = .{
+            .ident = @intCast(fd),
+            .filter = if (event == 0) std.posix.system.EVFILT.READ else std.posix.system.EVFILT.WRITE,
+            .flags = std.posix.system.EV.ADD | std.posix.system.EV.ONESHOT,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        };
+        var no_events: [0]std.posix.Kevent = undefined;
+        const rc = std.posix.system.kevent(kq, @ptrCast(&change), 1, @ptrCast(&no_events), 0, null);
+        if (rc < 0) return error.PrimitiveFailed;
+
+        try self.ensureMainProcess();
+        const active = self.current_process;
+        object.setSlot(active, object.SLOT_PROCESS_STATE, self.globals.sym_waiting);
+        object.setSlot(active, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(fd));
+        object.setSlot(active, object.SLOT_PROCESS_WAIT_EVENT, oop_mod.fromInt(@intCast(event)));
+        self.ioWaitEnqueue(active);
+        try self.scheduleNext();
+    }
+
+    /// Push `process` on the I/O-wait list. Order is irrelevant —
+    /// kqueue is the source of truth for which fd is ready; the
+    /// list exists only so `expireIoWaiters` can find a process
+    /// by fd, and so the GC's slot walk keeps it alive.
+    fn ioWaitEnqueue(self: *Vm, process: Oop) void {
+        const sched = self.globals.processor;
+        if (!oop_mod.isHeapPtr(sched)) return;
+        const head = object.slot(sched, object.SLOT_SCHEDULER_IO_HEAD);
+        object.setSlot(process, object.SLOT_PROCESS_NEXT_LINK, head);
+        object.setSlot(sched, object.SLOT_SCHEDULER_IO_HEAD, process);
+    }
+
+    /// Drain ready events from kqueue with the given timeout. For
+    /// each ready fd, find the process parked on it, unlink from
+    /// the io list, and re-queue it as runnable. Caller passes
+    /// `null` timeout to block until something becomes ready, or
+    /// a `&zero_ts` to poll without blocking.
+    pub fn expireIoWaiters(self: *Vm, timeout: ?*const std.posix.timespec) void {
+        if (self.kq_fd < 0) return;
+        const sched = self.globals.processor;
+        if (!oop_mod.isHeapPtr(sched)) return;
+        if (oop_mod.isNil(object.slot(sched, object.SLOT_SCHEDULER_IO_HEAD))) return;
+
+        var events: [16]std.posix.Kevent = undefined;
+        var no_changes: [0]std.posix.Kevent = undefined;
+        const rc = std.posix.system.kevent(self.kq_fd, @ptrCast(&no_changes), 0, @ptrCast(&events), @intCast(events.len), timeout);
+        if (rc <= 0) return;
+        const n: usize = @intCast(rc);
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            const ready_fd: i64 = @intCast(events[k].ident);
+            // Linear walk of the io list to find the matching
+            // process. The list is bounded by concurrent I/O depth
+            // (typically tens), so O(n) is fine.
+            var prev: Oop = oop_mod.NIL;
+            var cur = object.slot(sched, object.SLOT_SCHEDULER_IO_HEAD);
+            while (oop_mod.isHeapPtr(cur)) {
+                const wait_fd_oop = object.slot(cur, object.SLOT_PROCESS_WAIT_FD);
+                if (oop_mod.isInt(wait_fd_oop) and oop_mod.toInt(wait_fd_oop) == ready_fd) {
+                    const next = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+                    if (oop_mod.isNil(prev)) {
+                        object.setSlot(sched, object.SLOT_SCHEDULER_IO_HEAD, next);
+                    } else {
+                        object.setSlot(prev, object.SLOT_PROCESS_NEXT_LINK, next);
+                    }
+                    object.setSlot(cur, object.SLOT_PROCESS_NEXT_LINK, oop_mod.NIL);
+                    object.setSlot(cur, object.SLOT_PROCESS_WAIT_FD, oop_mod.fromInt(-1));
+                    object.setSlot(cur, object.SLOT_PROCESS_STATE, self.globals.sym_runnable);
+                    self.enqueueRunnable(cur);
+                    break;
+                }
+                prev = cur;
+                cur = object.slot(cur, object.SLOT_PROCESS_NEXT_LINK);
+            }
+        }
     }
 
     /// Move every sleeping process whose deadline has passed off
@@ -607,17 +711,47 @@ pub const Vm = struct {
         const active_state = object.slot(active, object.SLOT_PROCESS_STATE);
 
         var next = self.dequeueHighestRunnable();
-        // Active is non-runnable and the run queue is empty, but
-        // some processes may still be sleeping. Block the host
-        // thread until the earliest deadline, expire, retry.
+        // Active is non-runnable and the run queue is empty.
+        // Block the host thread until something becomes runnable:
+        //   * delay-queue head deadline elapses, OR
+        //   * an I/O-wait fd reports ready,
+        // whichever fires first. With both queues empty we bail
+        // (caller surfaces PrimitiveFailed for the deadlock).
         while (oop_mod.isNil(next) and active_state != self.globals.sym_runnable) {
             const sched = self.globals.processor;
             if (!oop_mod.isHeapPtr(sched)) break;
-            const head = object.slot(sched, object.SLOT_SCHEDULER_DELAY_HEAD);
-            if (!oop_mod.isHeapPtr(head)) break;
-            const dl_oop = object.slot(head, object.SLOT_PROCESS_DEADLINE);
-            if (!oop_mod.isInt(dl_oop)) break;
-            nanosleepFor(oop_mod.toInt(dl_oop) - monotonicNanos());
+            const delay_head = object.slot(sched, object.SLOT_SCHEDULER_DELAY_HEAD);
+            const io_head = object.slot(sched, object.SLOT_SCHEDULER_IO_HEAD);
+
+            const have_delay = oop_mod.isHeapPtr(delay_head);
+            const have_io = oop_mod.isHeapPtr(io_head);
+            if (!have_delay and !have_io) break;
+
+            // Compute kqueue timeout: bounded by delay deadline if
+            // any sleeper has one. `null` means block forever.
+            var ts: std.posix.timespec = undefined;
+            var ts_ptr: ?*const std.posix.timespec = null;
+            if (have_delay) {
+                const dl_oop = object.slot(delay_head, object.SLOT_PROCESS_DEADLINE);
+                if (oop_mod.isInt(dl_oop)) {
+                    const delta = oop_mod.toInt(dl_oop) - monotonicNanos();
+                    const clamped = if (delta > 0) delta else 0;
+                    ts = .{
+                        .sec = @intCast(@divTrunc(clamped, std.time.ns_per_s)),
+                        .nsec = @intCast(@mod(clamped, std.time.ns_per_s)),
+                    };
+                    ts_ptr = &ts;
+                }
+            }
+
+            if (have_io) {
+                self.expireIoWaiters(ts_ptr);
+            } else {
+                // Pure-sleep path: keep the existing nanosleep so
+                // we don't pay for a kqueue init on programs that
+                // only use Delay.
+                if (ts_ptr) |p| nanosleepFor(@as(i64, @intCast(p.sec)) * std.time.ns_per_s + @as(i64, @intCast(p.nsec)));
+            }
             next = self.dequeueHighestRunnable();
         }
 

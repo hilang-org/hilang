@@ -18,4 +18,5 @@ comptime {
     _ = @import("test_strings.zig");
     _ = @import("test_http.zig");
     _ = @import("test_datetime.zig");
+    _ = @import("test_nonblocking.zig");
 }
