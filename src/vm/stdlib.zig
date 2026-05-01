@@ -3135,4 +3135,49 @@ pub fn loadConcurrency(heap: *Heap, g: *Globals) !void {
     try defineMethod(c, rand_meta, "seed:", &.{"anInt"}, &.{}, &.{
         try ret(c, try send(c, try superSend(c, "new", &.{}), "initSeed:", &.{try varRef(c, "anInt")})),
     });
+
+    // ---- Array class>>parallel:do: — fan-out helper ----
+    //
+    // Forks `aCount` green threads, each running `aBlock value: i`
+    // for i in 1..aCount, then joins all of them and returns an
+    // Array of the per-worker results in index order. The
+    // existing block-arg-binding semantics ensure each fork
+    // captures its own `i`; the join loop preserves order even
+    // though workers terminate non-deterministically.
+    //
+    // parallel: aCount do: aBlock
+    //   | procs results |
+    //   procs := Array new: aCount.
+    //   results := Array new: aCount.
+    //   1 to: aCount do: [:i |
+    //     procs at: i put: [aBlock value: i] fork].
+    //   1 to: aCount do: [:i |
+    //     results at: i put: (procs at: i) join].
+    //   ^results
+    const array_meta = object.headerOf(g.array_class).class;
+    try defineMethod(c, array_meta, "parallel:do:", &.{ "aCount", "aBlock" }, &.{ "procs", "results" }, &.{
+        try assignNode(c, "procs", try send(c, try varRef(c, "Array"), "new:", &.{try varRef(c, "aCount")})),
+        try assignNode(c, "results", try send(c, try varRef(c, "Array"), "new:", &.{try varRef(c, "aCount")})),
+        try send(c, try litInt(c, 1), "to:do:", &.{
+            try varRef(c, "aCount"),
+            try block(c, &.{"i"}, &.{}, &.{
+                try send(c, try varRef(c, "procs"), "at:put:", &.{
+                    try varRef(c, "i"),
+                    try send(c, try block(c, &.{}, &.{}, &.{
+                        try send(c, try varRef(c, "aBlock"), "value:", &.{try varRef(c, "i")}),
+                    }), "fork", &.{}),
+                }),
+            }),
+        }),
+        try send(c, try litInt(c, 1), "to:do:", &.{
+            try varRef(c, "aCount"),
+            try block(c, &.{"i"}, &.{}, &.{
+                try send(c, try varRef(c, "results"), "at:put:", &.{
+                    try varRef(c, "i"),
+                    try send(c, try send(c, try varRef(c, "procs"), "at:", &.{try varRef(c, "i")}), "join", &.{}),
+                }),
+            }),
+        }),
+        try ret(c, try varRef(c, "results")),
+    });
 }

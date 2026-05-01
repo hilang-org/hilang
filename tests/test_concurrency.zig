@@ -688,6 +688,95 @@ test "Process without onCrash: silently swallows the exception" {
     try std.testing.expectEqual(@as(i64, 42), vm.oop.toInt(got));
 }
 
+test "Array parallel:do: fans out N workers and returns results in index order" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+
+    // Array parallel: 5 do: [:i | i * i]   →   #(1 4 9 16 25)
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"PR"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Array"},"selector":"parallel:do:","args":[
+        \\    {"literal":{"int":5}},
+        \\    {"block":{"params":["i"],"temps":[],"body":[
+        \\      {"send":{"receiver":{"var_ref":"i"},"selector":"*","args":[{"var_ref":"i"}]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}}
+    );
+
+    const expected = [_]i64{ 1, 4, 9, 16, 25 };
+    for (expected, 1..) |want, idx| {
+        var buf: [192]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf,
+            "{{\"send\":{{\"receiver\":{{\"var_ref\":\"PR\"}},\"selector\":\"at:\",\"args\":[{{\"literal\":{{\"int\":{}}}}}]}}}}",
+            .{idx},
+        );
+        const got = try env.evalJson(json);
+        try std.testing.expectEqual(want, vm.oop.toInt(got));
+    }
+    const sz = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"PR"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 5), vm.oop.toInt(sz));
+}
+
+test "Array parallel:do: workers actually run concurrently via the scheduler" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    // Each worker yields between two log writes. If they
+    // serialised, the log would be ['1a' '1b' '2a' '2b' '3a'
+    // '3b']. Concurrent execution interleaves them. We assert
+    // the size is right and at least one interleave happened.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"PLog"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"send":{"receiver":{"var_ref":"OrderedCollection"},"selector":"new","args":[]}},"selector":"init","args":[]}}
+        \\]}}
+    );
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Array"},"selector":"parallel:do:","args":[
+        \\  {"literal":{"int":3}},
+        \\  {"block":{"params":["i"],"temps":[],"body":[
+        \\    {"send":{"receiver":{"var_ref":"PLog"},"selector":"addLast:","args":[{"var_ref":"i"}]}},
+        \\    {"send":{"receiver":{"var_ref":"Processor"},"selector":"yield","args":[]}},
+        \\    {"send":{"receiver":{"var_ref":"PLog"},"selector":"addLast:","args":[
+        \\      {"send":{"receiver":{"var_ref":"i"},"selector":"+","args":[{"literal":{"int":100}}]}}
+        \\    ]}}
+        \\  ]}}
+        \\]}}
+    );
+
+    const sz = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"PLog"},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 6), vm.oop.toInt(sz));
+    // The first worker logs `1` first; if execution were
+    // serial, the second log entry would be `1+100 = 101`.
+    // Concurrent execution means a different worker (`2` or
+    // `3`) ran second. Anything other than 101 in slot 2
+    // proves overlap.
+    const second = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"PLog"},"selector":"at:","args":[{"literal":{"int":2}}]}}
+    );
+    try std.testing.expect(vm.oop.toInt(second) != 101);
+}
+
+test "Array parallel:do: with count 0 returns an empty Array" {
+    var env: TestEnv = undefined;
+    try env.init();
+    defer env.deinit();
+    const got = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"Array"},"selector":"parallel:do:","args":[
+        \\  {"literal":{"int":0}},
+        \\  {"block":{"params":["i"],"temps":[],"body":[{"var_ref":"i"}]}}
+        \\]}},"selector":"size","args":[]}}
+    );
+    try std.testing.expectEqual(@as(i64, 0), vm.oop.toInt(got));
+}
+
 test "Process>>join blocks until the worker terminates and returns its result" {
     var env: TestEnv = undefined;
     try env.init();
