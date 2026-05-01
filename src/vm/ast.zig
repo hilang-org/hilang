@@ -170,6 +170,10 @@ fn parseLiteralValue(heap: *Heap, g: *const Globals, v: std.json.Value) ParseErr
         @memcpy(object.bytesOf(obj_oop)[0..s.len], s);
         return obj_oop;
     }
+    if (std.mem.eql(u8, tag, "symbol")) {
+        if (payload != .string) return error.BadFieldType;
+        return dict.newSymbol(heap, g, payload.string) catch return error.OutOfMemory;
+    }
     if (std.mem.eql(u8, tag, "float")) {
         // Accept either a JSON number (real) or an integer.
         const f: f64 = switch (payload) {

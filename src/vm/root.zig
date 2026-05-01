@@ -2,6 +2,7 @@ pub const oop = @import("oop.zig");
 pub const object = @import("object.zig");
 pub const heap = @import("heap.zig");
 pub const ast = @import("ast.zig");
+pub const smalltalk = @import("smalltalk.zig");
 pub const eval = @import("eval.zig");
 pub const print = @import("print.zig");
 pub const globals = @import("globals.zig");
@@ -30,4 +31,5 @@ comptime {
     _ = @import("eval.zig");
     _ = @import("jit.zig");
     _ = @import("scheduler.zig");
+    _ = @import("smalltalk.zig");
 }

@@ -46,6 +46,13 @@ pub const TestEnv = struct {
         return self.machine.evalAsTopLevel(node);
     }
 
+    pub fn evalSource(self: *TestEnv, source: []const u8) !vm.Oop {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const node = try vm.smalltalk.parseTopLevelToHeap(&self.heap, &self.machine.globals, arena.allocator(), source);
+        return self.machine.evalAsTopLevel(node);
+    }
+
     pub fn defineClass(
         self: *TestEnv,
         name: []const u8,
@@ -125,6 +132,44 @@ pub const TestEnv = struct {
             &self.machine,
             cls,
             selector,
+            method,
+        );
+    }
+
+    pub fn installMethodSource(
+        self: *TestEnv,
+        class_name: []const u8,
+        method_source: []const u8,
+    ) !void {
+        const cls = vm.dict.lookup(self.machine.globals.smalltalk, class_name);
+        if (vm.oop.isNil(cls)) return error.UnknownClass;
+
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+
+        const lowered = try vm.smalltalk.parseMethodToHeap(
+            &self.heap,
+            &self.machine.globals,
+            arena.allocator(),
+            method_source,
+        );
+
+        const method = try vm.method.newAst(
+            &self.heap,
+            &self.machine.globals,
+            cls,
+            lowered.selector,
+            lowered.arg_count,
+            lowered.params_arr,
+            lowered.temps_arr,
+            lowered.body_arr,
+        );
+        try vm.method.install(
+            &self.heap,
+            &self.machine.globals,
+            &self.machine,
+            cls,
+            lowered.selector,
             method,
         );
     }

@@ -59,6 +59,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return;
     }
 
+    if (std.mem.eql(u8, cmd, "eval-st")) {
+        if (idx >= args_list.items.len) {
+            std.debug.print("eval-st: missing Smalltalk source argument\n", .{});
+            std.process.exit(2);
+        }
+        const source = args_list.items[idx];
+
+        var req: std.ArrayList(u8) = .empty;
+        defer req.deinit(allocator);
+        try req.appendSlice(allocator, "{\"kind\":\"eval_source\",\"source\":");
+        try appendJsonString(allocator, &req, source);
+        try req.append(allocator, '}');
+
+        try sendRequest(allocator, socket_path, req.items);
+        return;
+    }
+
     try usage();
     std.process.exit(2);
 }
@@ -73,6 +90,7 @@ fn usage() !void {
         \\Commands:
         \\  ping                 health check
         \\  eval <ast-json>      evaluate an AST node, print response
+        \\  eval-st <source>     evaluate canonical Smalltalk source
         \\
     ;
     std.debug.print("{s}", .{msg});
@@ -116,4 +134,27 @@ fn writeAll(fd: std.posix.fd_t, buf: []const u8) !void {
         if (n <= 0) return error.WriteFailed;
         off += @intCast(n);
     }
+}
+
+fn appendJsonString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    try out.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    var hex: [6]u8 = undefined;
+                    _ = try std.fmt.bufPrint(&hex, "\\u{x:0>4}", .{c});
+                    try out.appendSlice(allocator, &hex);
+                } else {
+                    try out.append(allocator, c);
+                }
+            },
+        }
+    }
+    try out.append(allocator, '"');
 }

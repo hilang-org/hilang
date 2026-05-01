@@ -177,6 +177,21 @@ fn dispatch(allocator: std.mem.Allocator, machine: *vm.Vm, line: []const u8, out
         return;
     }
 
+    if (std.mem.eql(u8, kind, "eval_source")) {
+        try handleEvalSource(allocator, machine, obj, out);
+        return;
+    }
+
+    if (std.mem.eql(u8, kind, "parse_source")) {
+        try handleParseSource(allocator, obj, out);
+        return;
+    }
+
+    if (std.mem.eql(u8, kind, "render_source")) {
+        try handleRenderSource(allocator, obj, out);
+        return;
+    }
+
     if (std.mem.eql(u8, kind, "classes")) {
         try handleClasses(allocator, machine, out);
         return;
@@ -184,6 +199,11 @@ fn dispatch(allocator: std.mem.Allocator, machine: *vm.Vm, line: []const u8, out
 
     if (std.mem.eql(u8, kind, "define_method")) {
         try handleDefineMethod(allocator, machine, obj, out);
+        return;
+    }
+
+    if (std.mem.eql(u8, kind, "define_method_source")) {
+        try handleDefineMethodSource(allocator, machine, obj, out);
         return;
     }
 
@@ -199,6 +219,11 @@ fn dispatch(allocator: std.mem.Allocator, machine: *vm.Vm, line: []const u8, out
 
     if (std.mem.eql(u8, kind, "methods")) {
         try handleMethods(allocator, machine, obj, out);
+        return;
+    }
+
+    if (std.mem.eql(u8, kind, "method_source")) {
+        try handleMethodSource(allocator, machine, obj, out);
         return;
     }
 
@@ -296,6 +321,180 @@ fn handleEval(allocator: std.mem.Allocator, machine: *vm.Vm, obj: std.json.Objec
     var dur_buf: [32]u8 = undefined;
     try out.appendSlice(allocator, try std.fmt.bufPrint(&dur_buf, "{d}", .{duration_ns}));
     try out.appendSlice(allocator, "}");
+}
+
+fn parseSourceAndEvalWithRetry(machine: *vm.Vm, scratch: std.mem.Allocator, source: []const u8) !vm.Oop {
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const node = vm.smalltalk.parseTopLevelToHeap(machine.heap, &machine.globals, scratch, source) catch |e| {
+            if (e == error.OutOfMemory and attempt == 0) {
+                try machine.collectGarbage();
+                continue;
+            }
+            return e;
+        };
+        return machine.evalAsTopLevel(node) catch |e| {
+            if (e == error.OutOfMemory and attempt == 0) {
+                try machine.collectGarbage();
+                continue;
+            }
+            return e;
+        };
+    }
+    return error.OutOfMemory;
+}
+
+fn handleEvalSource(allocator: std.mem.Allocator, machine: *vm.Vm, obj: std.json.ObjectMap, out: *std.ArrayList(u8)) !void {
+    const source_v = obj.get("source") orelse {
+        try writeError(allocator, out, "BadRequest", "missing 'source' field");
+        return;
+    };
+    if (source_v != .string) {
+        try writeError(allocator, out, "BadRequest", "'source' must be a string");
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var capture: std.ArrayList(u8) = .empty;
+    defer capture.deinit(allocator);
+    machine.output = .{ .buffer = &capture, .allocator = allocator };
+    defer machine.output = null;
+
+    const t_start = nowNs();
+    const result = parseSourceAndEvalWithRetry(machine, a, source_v.string) catch |e| {
+        try writeError(allocator, out, "EvalError", @errorName(e));
+        return;
+    };
+    const duration_ns = nowNs() - t_start;
+
+    const printed = vm.print.printString(a, machine, result) catch |e| {
+        try writeError(allocator, out, "PrintError", @errorName(e));
+        return;
+    };
+
+    try out.appendSlice(allocator, "{\"ok\":true,\"oop\":");
+    var oop_buf: [32]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&oop_buf, "{d}", .{result}));
+    try out.appendSlice(allocator, ",\"printed\":");
+    try writeJsonString(allocator, out, printed);
+    try out.appendSlice(allocator, ",\"output\":");
+    try writeJsonString(allocator, out, capture.items);
+    try out.appendSlice(allocator, ",\"duration_ns\":");
+    var dur_buf: [32]u8 = undefined;
+    try out.appendSlice(allocator, try std.fmt.bufPrint(&dur_buf, "{d}", .{duration_ns}));
+    try out.appendSlice(allocator, "}");
+}
+
+fn handleParseSource(allocator: std.mem.Allocator, obj: std.json.ObjectMap, out: *std.ArrayList(u8)) !void {
+    const source_v = obj.get("source") orelse {
+        try writeError(allocator, out, "BadRequest", "missing 'source'");
+        return;
+    };
+    if (source_v != .string) {
+        try writeError(allocator, out, "BadRequest", "'source' must be string");
+        return;
+    }
+    const mode: []const u8 = blk: {
+        const mode_v = obj.get("mode") orelse break :blk "eval";
+        if (mode_v != .string) {
+            try writeError(allocator, out, "BadRequest", "'mode' must be string");
+            return;
+        }
+        break :blk mode_v.string;
+    };
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    if (std.mem.eql(u8, mode, "method")) {
+        const method = vm.smalltalk.parseMethod(a, source_v.string) catch |e| {
+            try writeError(allocator, out, "ParseError", @errorName(e));
+            return;
+        };
+        const method_json = vm.smalltalk.renderMethodJson(a, method) catch |e| {
+            try writeError(allocator, out, "RenderError", @errorName(e));
+            return;
+        };
+        const canonical = vm.smalltalk.renderMethodSource(a, method) catch |e| {
+            try writeError(allocator, out, "RenderError", @errorName(e));
+            return;
+        };
+        try out.appendSlice(allocator, "{\"ok\":true,\"mode\":\"method\",\"method\":");
+        try out.appendSlice(allocator, method_json);
+        try out.appendSlice(allocator, ",\"source\":");
+        try writeJsonString(allocator, out, canonical);
+        try out.appendSlice(allocator, "}");
+        return;
+    }
+
+    if (!std.mem.eql(u8, mode, "eval")) {
+        try writeError(allocator, out, "BadRequest", "unsupported mode");
+        return;
+    }
+
+    const node = vm.smalltalk.parseTopLevel(a, source_v.string) catch |e| {
+        try writeError(allocator, out, "ParseError", @errorName(e));
+        return;
+    };
+    const node_json = vm.smalltalk.renderTopLevelJson(a, node) catch |e| {
+        try writeError(allocator, out, "RenderError", @errorName(e));
+        return;
+    };
+    const canonical = vm.smalltalk.renderTopLevelSource(a, node) catch |e| {
+        try writeError(allocator, out, "RenderError", @errorName(e));
+        return;
+    };
+    try out.appendSlice(allocator, "{\"ok\":true,\"mode\":\"eval\",\"node\":");
+    try out.appendSlice(allocator, node_json);
+    try out.appendSlice(allocator, ",\"source\":");
+    try writeJsonString(allocator, out, canonical);
+    try out.appendSlice(allocator, "}");
+}
+
+fn handleRenderSource(allocator: std.mem.Allocator, obj: std.json.ObjectMap, out: *std.ArrayList(u8)) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    if (obj.get("node")) |node_v| {
+        const node = vm.smalltalk.nodeFromJsonValue(a, node_v) catch |e| {
+            try writeError(allocator, out, "ParseError", @errorName(e));
+            return;
+        };
+        const source = vm.smalltalk.renderTopLevelSource(a, node) catch |e| {
+            try writeError(allocator, out, "RenderError", @errorName(e));
+            return;
+        };
+        try out.appendSlice(allocator, "{\"ok\":true,\"source\":");
+        try writeJsonString(allocator, out, source);
+        try out.appendSlice(allocator, "}");
+        return;
+    }
+
+    if (obj.get("method")) |method_v| {
+        if (method_v != .object) {
+            try writeError(allocator, out, "BadRequest", "'method' must be object");
+            return;
+        }
+        const method = vm.smalltalk.methodFromJsonObject(a, method_v.object) catch |e| {
+            try writeError(allocator, out, "ParseError", @errorName(e));
+            return;
+        };
+        const source = vm.smalltalk.renderMethodSource(a, method) catch |e| {
+            try writeError(allocator, out, "RenderError", @errorName(e));
+            return;
+        };
+        try out.appendSlice(allocator, "{\"ok\":true,\"source\":");
+        try writeJsonString(allocator, out, source);
+        try out.appendSlice(allocator, "}");
+        return;
+    }
+
+    try writeError(allocator, out, "BadRequest", "missing 'node' or 'method'");
 }
 
 fn handleSnapshot(allocator: std.mem.Allocator, machine: *vm.Vm, obj: std.json.ObjectMap, out: *std.ArrayList(u8)) !void {
@@ -491,6 +690,51 @@ fn handleMethods(allocator: std.mem.Allocator, machine: *vm.Vm, obj: std.json.Ob
     try out.appendSlice(allocator, "]}");
 }
 
+fn handleMethodSource(allocator: std.mem.Allocator, machine: *vm.Vm, obj: std.json.ObjectMap, out: *std.ArrayList(u8)) !void {
+    const class_v = obj.get("class") orelse {
+        try writeError(allocator, out, "BadRequest", "missing 'class'");
+        return;
+    };
+    const sel_v = obj.get("selector") orelse {
+        try writeError(allocator, out, "BadRequest", "missing 'selector'");
+        return;
+    };
+    if (class_v != .string or sel_v != .string) {
+        try writeError(allocator, out, "BadRequest", "wrong field types");
+        return;
+    }
+
+    const cls = vm.dict.lookup(machine.globals.smalltalk, class_v.string);
+    if (vm.oop.isNil(cls)) {
+        try writeError(allocator, out, "UnknownClass", class_v.string);
+        return;
+    }
+    const sel_sym = vm.dict.newSymbol(machine.heap, &machine.globals, sel_v.string) catch {
+        try writeError(allocator, out, "OutOfMemory", "selector symbol");
+        return;
+    };
+    const method = vm.method.lookupBySym(cls, sel_sym);
+    if (vm.oop.isNil(method)) {
+        try writeError(allocator, out, "UnknownSelector", sel_v.string);
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const source = vm.smalltalk.renderMethodSourceFromHeap(arena.allocator(), &machine.globals, method) catch |e| {
+        try writeError(allocator, out, "RenderError", @errorName(e));
+        return;
+    };
+
+    try out.appendSlice(allocator, "{\"ok\":true,\"class\":");
+    try writeJsonString(allocator, out, class_v.string);
+    try out.appendSlice(allocator, ",\"selector\":");
+    try writeJsonString(allocator, out, sel_v.string);
+    try out.appendSlice(allocator, ",\"source\":");
+    try writeJsonString(allocator, out, source);
+    try out.appendSlice(allocator, "}");
+}
+
 fn handleDefineClass(allocator: std.mem.Allocator, machine: *vm.Vm, obj: std.json.ObjectMap, out: *std.ArrayList(u8)) !void {
     const name_v = obj.get("name") orelse {
         try writeError(allocator, out, "BadRequest", "missing 'name'");
@@ -651,6 +895,59 @@ fn handleDefineMethod(allocator: std.mem.Allocator, machine: *vm.Vm, obj: std.js
     try writeJsonString(allocator, out, class_v.string);
     try out.appendSlice(allocator, ",\"selector\":");
     try writeJsonString(allocator, out, sel_v.string);
+    try out.appendSlice(allocator, "}");
+}
+
+fn handleDefineMethodSource(allocator: std.mem.Allocator, machine: *vm.Vm, obj: std.json.ObjectMap, out: *std.ArrayList(u8)) !void {
+    const class_v = obj.get("class") orelse {
+        try writeError(allocator, out, "BadRequest", "missing 'class'");
+        return;
+    };
+    const source_v = obj.get("source") orelse {
+        try writeError(allocator, out, "BadRequest", "missing 'source'");
+        return;
+    };
+    if (class_v != .string or source_v != .string) {
+        try writeError(allocator, out, "BadRequest", "wrong field types");
+        return;
+    }
+
+    const cls = vm.dict.lookup(machine.globals.smalltalk, class_v.string);
+    if (vm.oop.isNil(cls)) {
+        try writeError(allocator, out, "UnknownClass", class_v.string);
+        return;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const lowered = vm.smalltalk.parseMethodToHeap(machine.heap, &machine.globals, arena.allocator(), source_v.string) catch |e| {
+        try writeError(allocator, out, "ParseError", @errorName(e));
+        return;
+    };
+
+    const method = vm.method.newAst(
+        machine.heap,
+        &machine.globals,
+        cls,
+        lowered.selector,
+        lowered.arg_count,
+        lowered.params_arr,
+        lowered.temps_arr,
+        lowered.body_arr,
+    ) catch {
+        try writeError(allocator, out, "OutOfMemory", "newAst");
+        return;
+    };
+
+    vm.method.install(machine.heap, &machine.globals, machine, cls, lowered.selector, method) catch {
+        try writeError(allocator, out, "InstallFailed", "install");
+        return;
+    };
+
+    try out.appendSlice(allocator, "{\"ok\":true,\"class\":");
+    try writeJsonString(allocator, out, class_v.string);
+    try out.appendSlice(allocator, ",\"selector\":");
+    try writeJsonString(allocator, out, lowered.selector);
     try out.appendSlice(allocator, "}");
 }
 
