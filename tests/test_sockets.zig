@@ -153,18 +153,28 @@ test "connect refusal surfaces a Smalltalk Exception with messageText" {
     try std.testing.expect(std.mem.startsWith(u8, bytes, "connect:"));
 }
 
-test "connectTo:port:timeout: surfaces 'connect: timed out' on a black hole" {
+test "connectTo:port:timeout: bounds the wait on a black hole" {
     var env: TestEnv = undefined;
     try env.init();
     defer env.deinit();
-    // 198.51.100.1 is in TEST-NET-2 (RFC 5737) — guaranteed to
-    // not respond. With a 100ms timeout the connect should
-    // surface a timeout exception rather than waiting on TCP's
-    // ~75s default SYN retry budget.
+    // 198.51.100.1 is in TEST-NET-2 (RFC 5737). Different
+    // environments respond differently: some return ECONNREFUSED
+    // / EHOSTUNREACH within a few ms, others let the SYN sit
+    // unanswered until our timeout fires. Both outcomes prove
+    // the timeout machinery works — the meaningful invariant is
+    // "we get a Smalltalk Exception promptly", not a specific
+    // messageText. We allow up to 2 s of slack for slow CI
+    // network paths; pre-fix this would have hung for ~75 s.
+    _ = try env.evalJson(
+        \\{"send":{"receiver":{"var_ref":"Smalltalk"},"selector":"at:put:","args":[
+        \\  {"send":{"receiver":{"literal":{"string":"CtT0"}},"selector":"asSymbol","args":[]}},
+        \\  {"send":{"receiver":{"var_ref":"Time"},"selector":"monotonicNanos","args":[]}}
+        \\]}}
+    );
     const got = try env.evalJson(
         \\{"send":{"receiver":{"block":{"params":[],"temps":[],"body":[
         \\  {"send":{"receiver":{"var_ref":"Socket"},"selector":"connectTo:port:timeout:","args":[
-        \\    {"literal":{"string":"198.51.100.1"}},{"literal":{"int":80}},{"literal":{"int":100}}
+        \\    {"literal":{"string":"198.51.100.1"}},{"literal":{"int":80}},{"literal":{"int":200}}
         \\  ]}}
         \\]}},"selector":"on:do:","args":[
         \\  {"var_ref":"Exception"},
@@ -174,10 +184,15 @@ test "connectTo:port:timeout: surfaces 'connect: timed out' on a black hole" {
         \\]}}
     );
     try std.testing.expect(vm.oop.isHeapPtr(got));
-    try std.testing.expectEqualStrings(
-        "connect: timed out",
-        vm.object.bytesOf(got)[0..vm.object.headerOf(got).size],
+    const bytes = vm.object.bytesOf(got)[0..vm.object.headerOf(got).size];
+    try std.testing.expect(std.mem.startsWith(u8, bytes, "connect:"));
+
+    const elapsed_oop = try env.evalJson(
+        \\{"send":{"receiver":{"send":{"receiver":{"var_ref":"Time"},"selector":"monotonicNanos","args":[]}},
+        \\  "selector":"-","args":[{"var_ref":"CtT0"}]}}
     );
+    const elapsed_ns = vm.oop.toInt(elapsed_oop);
+    try std.testing.expect(elapsed_ns < 2_000_000_000);
 }
 
 test "garbage hostname still raises PrimitiveFailed" {

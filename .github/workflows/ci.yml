@@ -7,7 +7,17 @@ on:
 
 jobs:
   build-test:
-    runs-on: macos-latest
+    # Build, test, and bench on both supported targets. macos-latest
+    # is Apple Silicon (M-series) since GitHub flipped the default
+    # in 2024; ubuntu-24.04-arm is the public ARM64 Linux runner.
+    # Both are aarch64 — hilang's JIT is AArch64-only by design.
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-latest
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
